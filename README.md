@@ -1,16 +1,27 @@
 <div align="center">
 
-# 🚁 Drone Path — Equation of Motion Finder
+<img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
+<img src="https://img.shields.io/badge/Streamlit-1.32+-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white"/>
+<img src="https://img.shields.io/badge/PyTorch-2.1+-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white"/>
+<img src="https://img.shields.io/badge/SINDy-Symbolic_Regression-8A2BE2?style=for-the-badge"/>
+<img src="https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge"/>
 
-**Draw a drone trajectory. Learn its physics. Get human-readable equations.**
+<br><br>
+
+# 🚁 Drone Path · Equation Finder
+
+**Draw a drone trajectory. A Graph Neural Network learns its physics.<br>
+Sparse regression writes the equations. RK4 re-flies the drone.**
+
+<br>
 
 [![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://drone-path-7kpgwzdwoih9vayensxuom.streamlit.app/)
 
-*A live demo combining Graph Neural Networks, Sparse Symbolic Regression, and Robotics Safety Analysis — all running in your browser, no installation required.*
+<sub>No installation · No GPU · No data · Just draw.</sub>
 
----
+<br>
 
-[🚀 Launch the App](https://drone-path-7kpgwzdwoih9vayensxuom.streamlit.app/) • [What It Does](#-what-it-does) • [The Math](#-the-mathematics) • [The ML](#-the-machine-learning) • [Safety System](#-safety-envelope) • [Run Locally](#-run-locally)
+[🚀 Live App](https://drone-path-7kpgwzdwoih9vayensxuom.streamlit.app/) · [What It Does](#-what-it-does) · [Quick Start](#-quick-start) · [The Math](#-the-mathematics) · [The ML](#-the-machine-learning) · [Safety System](#-safety-envelope) · [Contributing](#-contributing)
 
 </div>
 
@@ -18,275 +29,355 @@
 
 ## 🎯 What It Does
 
-You draw a 2-D flight path with your mouse. In seconds, the app:
+This project is an **educational demo** for researchers, students, and engineers curious about system identification and graph learning. It shows how a single user-drawn curve can be automatically turned into a physics equation using modern machine learning — with no training data, no labels, and no pre-training.
 
-1. **Learns the physics** of your path using a Graph Neural Network
-2. **Discovers the equations of motion** — short, human-readable formulas like:
-   ```
-   d²x/dt² = −0.82·vx + 3.11·cos(y)
-   d²y/dt² = −5.67·vy + 2.44·x
-   ```
-3. **Re-flies the drone** by integrating those equations forward in time
-4. **Flags unsafe segments** where speed, acceleration, or curvature exceed safety limits
+**Typical use cases:**
+- Learning how SINDy and GNNs work by playing with a visual interface
+- Demonstrating symbolic regression to non-technical audiences
+- Exploring how trajectory curvature, speed, and acceleration relate
+- A starting point for robotics system-identification research
 
-No data. No training set. No cloud GPU. Just your drawing and mathematics.
+### The 7-Step Pipeline
+
+```
+✏️  Draw        →  sketch a 2-D flight path with your mouse
+📐  Resample    →  arc-length resampling to uniform time steps
+🔬  Smooth      →  Savitzky–Golay filter computes clean derivatives
+🕸️  Graph       →  trajectory becomes a temporal graph
+🧠  GNN         →  Graph Neural Network predicts accelerations
+📝  SINDy       →  sparse regression writes human-readable equations
+▶️  Simulate    →  RK4 integrates the equations to re-fly the drone
+🛡️  Safety      →  speed, acceleration and curvature are flagged
+```
+
+**Output example — equations discovered from a figure-8 path:**
+```
+d²x/dt² = −0.83·vx + 2.14·cos(y)
+d²y/dt² = −4.91·vy + 1.73·x
+```
+
+These are real differential equations your drone would need to satisfy to follow that exact path.
+
+---
+
+## ⚡ Quick Start
+
+### Option A — Use the Live App (recommended)
+
+Click the badge below. No setup required.
+
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://drone-path-7kpgwzdwoih9vayensxuom.streamlit.app/)
+
+### Option B — Run Locally
+
+```bash
+# Clone
+git clone https://github.com/Ma-Mar-Itan/Drone-path.git
+cd Drone-path
+
+# Install
+pip install -r requirements.txt
+
+# Run
+streamlit run App.py
+```
+
+Opens at `http://localhost:8501`. Requires **Python 3.10+**, CPU only.
+
+### Usage in 4 clicks
+
+1. **Draw** a continuous path on the canvas (spirals, figure-8s, zigzags all work)
+2. Click **🔧 Fit Model** — GNN trains in ~10 seconds
+3. Click **▶️ Simulate** — RK4 re-flies the drone from the equations
+4. Explore the **Equations, Safety, and Training** tabs
+
+> **Tip:** Draw smooth, continuous strokes. Sharp disconnected dots give poor results.  
+> **Tip:** If simulation diverges, raise the **Sparsity λ** slider to force a simpler equation.
 
 ---
 
 ## 🔢 The Mathematics
 
-### 1 — Arc-Length Resampling
+### Step 1 · Arc-Length Resampling
 
-Raw mouse strokes are unevenly spaced — the mouse moves fast on straight segments and slow at corners. We need uniform time steps for any physical analysis.
+Raw mouse strokes are unevenly spaced — fast on straight sections, slow at corners. We need uniform time steps for any physical analysis.
 
-Given raw points $(x_i, y_i)$, the cumulative arc-length is:
-
-$$s_k = \sum_{i=1}^{k} \sqrt{(\Delta x_i)^2 + (\Delta y_i)^2}$$
-
-We then interpolate to find $N$ points equally spaced along $s$, producing a trajectory parameterised by uniform time $t = 0, \Delta t, 2\Delta t, \ldots$
-
----
-
-### 2 — Savitzky–Golay Differentiation
-
-To compute velocity and acceleration we need derivatives of noisy, discrete data. Naive finite differences amplify noise. Instead we use the **Savitzky–Golay filter** (1964):
-
-Within a sliding window of width $w$, fit a polynomial of degree $p$ to the data:
-
-$$\hat{x}(t) = \sum_{k=0}^{p} c_k \, t^k$$
-
-The fitted polynomial is analytically differentiated to yield smooth, accurate derivatives:
-
-$$v_x = \frac{d\hat{x}}{dt}, \qquad a_x = \frac{d^2\hat{x}}{dt^2}$$
-
-This gives us a clean dataset of states and accelerations: $(x, y, v_x, v_y, a_x, a_y)$ at every time step.
-
----
-
-### 3 — The Temporal Graph
-
-The trajectory is modelled as a **directed graph** $\mathcal{G} = (\mathcal{V}, \mathcal{E})$:
-
-- **Nodes** $\mathcal{V}$ — each time step $t_i$ is a node with feature vector $\mathbf{h}_i = [x_i,\; y_i,\; v_{x,i},\; v_{y,i}]$
-- **Edges** $\mathcal{E}$ — node $i$ connects to node $j$ if $|i - j| \leq k$ (temporal neighbourhood of radius $k$, plus a self-loop)
-
-The adjacency matrix $A \in \mathbb{R}^{N \times N}$ is row-normalised:
-
-$$\tilde{A}_{ij} = \frac{A_{ij}}{\sum_j A_{ij}}$$
-
-**Why a graph?** A single snapshot $(x, y, v_x, v_y)$ at time $t$ is not enough to infer acceleration accurately — especially at a turn, where you need to "see" nearby time steps to understand the curvature. The graph structure gives each node local spatio-temporal context.
-
----
-
-### 4 — Sparse Identification of Nonlinear Dynamics (SINDy)
-
-After learning dynamics with the GNN, we want a *human-readable* equation. Enter **SINDy** (Brunton, Proctor & Kutz, 2016).
-
-We build a **feature library** $\Theta \in \mathbb{R}^{N \times F}$ of candidate basis functions evaluated at every time step:
-
-$$\Theta = \begin{bmatrix} 1 & x & y & v_x & v_y & x^2 & y^2 & xy & v_x^2 & v_y^2 & v_x v_y & \sin x & \sin y & \cos x & \cos y \end{bmatrix}$$
-
-We then solve two **sparse regression** problems:
-
-$$a_x \approx \Theta\,\mathbf{w}_x, \qquad a_y \approx \Theta\,\mathbf{w}_y$$
-
-subject to $\mathbf{w}$ being **sparse** — most entries should be zero, keeping only the terms that truly matter.
-
-**STLSQ — Sequential Thresholded Least Squares:**
+Compute cumulative arc-length, then interpolate to **N uniformly-spaced points**:
 
 ```
-1. Fit w = (ΘᵀΘ)⁻¹Θᵀa  (ordinary least squares)
-2. Zero out all |w_i| < λ  (threshold λ = sparsity slider)
-3. Refit on remaining active features only
-4. Repeat until convergence
-```
+s_k = Σ √(Δxᵢ² + Δyᵢ²)
 
-The surviving non-zero coefficients form your equation of motion. The **sparsity slider** in the UI controls $\lambda$ — higher means fewer, simpler terms.
+Interpolate x(s), y(s) at   s = 0,  L/(N−1),  2L/(N−1), ...
+```
 
 ---
 
-### 5 — RK4 Forward Simulation
+### Step 2 · Savitzky–Golay Differentiation
 
-The symbolic equations define a complete ODE system:
+Within a sliding window of width *w*, fit a polynomial of degree *p* and differentiate it analytically:
 
-$$\frac{d}{dt}\begin{pmatrix} x \\ y \\ v_x \\ v_y \end{pmatrix} = \begin{pmatrix} v_x \\ v_y \\ f(x, y, v_x, v_y) \\ g(x, y, v_x, v_y) \end{pmatrix}$$
+```
+x̂(t) = Σ cₖ tᵏ     →     vx = dx̂/dt     →     ax = d²x̂/dt²
+```
 
-where $f$ and $g$ are the SINDy equations. We integrate this forward using **4th-order Runge–Kutta**:
+**Why not finite differences?**  
+Finite differences amplify noise with error **O(Δt)**. Savitzky–Golay achieves **O(Δt^(p+1))** — the difference between clean, usable derivatives and noise.
 
-$$\mathbf{s}_{n+1} = \mathbf{s}_n + \frac{\Delta t}{6}(\mathbf{k}_1 + 2\mathbf{k}_2 + 2\mathbf{k}_3 + \mathbf{k}_4)$$
+---
 
-$$\mathbf{k}_1 = F(\mathbf{s}_n), \quad \mathbf{k}_2 = F\!\left(\mathbf{s}_n + \tfrac{\Delta t}{2}\mathbf{k}_1\right), \quad \mathbf{k}_3 = F\!\left(\mathbf{s}_n + \tfrac{\Delta t}{2}\mathbf{k}_2\right), \quad \mathbf{k}_4 = F(\mathbf{s}_n + \Delta t\,\mathbf{k}_3)$$
+### Step 3 · Normalisation *(the stability fix)*
 
-RK4 has local truncation error $O(\Delta t^5)$, making it far more accurate than Euler integration for the same step size.
+Before any regression, every feature is normalised to zero-mean, unit-std:
+
+```
+x_norm = (x − μₓ) / σₓ        for each of [x, y, vx, vy, ax, ay]
+```
+
+**Why this is critical:**  
+The feature library contains `sin(x)` and `cos(x)`. At raw pixel scale (x ≈ 200–600 px), these wrap hundreds of times and produce useless coefficients that explode during simulation. In normalised space (x ∈ [−2, +2] approximately), they are well-defined and physically meaningful.
+
+The normalisation statistics are stored and applied at **every RK4 step** during simulation — inputs are normalised in, accelerations are de-normalised out.
+
+---
+
+### Step 4 · SINDy — Sparse Identification of Nonlinear Dynamics
+
+Build a **feature library** Θ of 15 candidate basis functions (evaluated on normalised state):
+
+```
+Θ = [ 1  x  y  vx  vy  x²  y²  xy  vx²  vy²  vx·vy  sin(x)  sin(y)  cos(x)  cos(y) ]
+```
+
+Solve two sparse regression problems:
+
+```
+ax_norm ≈ Θ · w_x        (find the x-acceleration equation)
+ay_norm ≈ Θ · w_y        (find the y-acceleration equation)
+```
+
+Subject to **w being sparse** — most coefficients should be zero, keeping only the terms that genuinely matter.
+
+**STLSQ Algorithm — Sequential Thresholded Least Squares:**
+
+```
+1.  w ← (ΘᵀΘ)⁻¹ Θᵀ a          ordinary least squares
+2.  set wᵢ = 0  for all |wᵢ| < λ    apply sparsity threshold
+3.  refit on active (non-zero) features only
+4.  repeat until no more terms are eliminated
+```
+
+The **λ slider** in the sidebar controls how aggressively terms are removed. Higher λ = simpler equation with fewer terms.
+
+---
+
+### Step 5 · RK4 Forward Simulation
+
+The discovered equations define a complete ODE system:
+
+```
+d/dt [x, y, vx, vy] = [vx,  vy,  f(x,y,vx,vy),  g(x,y,vx,vy)]
+```
+
+Integrated with **4th-order Runge–Kutta**:
+
+```
+s_{n+1} = sₙ + (Δt/6)(k₁ + 2k₂ + 2k₃ + k₄)
+
+k₁ = F(sₙ)                      k₂ = F(sₙ + Δt/2 · k₁)
+k₃ = F(sₙ + Δt/2 · k₂)         k₄ = F(sₙ + Δt · k₃)
+```
+
+Local truncation error **O(Δt⁵)** — 4 orders of magnitude more accurate than Euler for the same step size.
 
 ---
 
 ## 🧠 The Machine Learning
 
-### Graph Neural Network Architecture
+### Graph Neural Network
 
-The GNN is implemented in **pure PyTorch** (no external graph libraries required). It follows the message-passing paradigm:
+The GNN is built in **pure PyTorch** (no PyTorch Geometric dependency).
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   TemporalGNN                           │
-│                                                         │
-│  Input X  (N × 4)   ─── [x, y, vx, vy] per node       │
-│  Adjacency A  (N × N)  ─── temporal neighbourhood      │
-│                                                         │
-│  ① Message MLP:   X  ──► messages  (4 → 64 → 64)       │
-│     Linear → Tanh → Linear                              │
-│                                                         │
-│  ② Aggregate:     M = Ã · messages(X)                  │
-│     Each node receives weighted sum of neighbour msgs   │
-│                                                         │
-│  ③ Concatenate:   [X ‖ M]   (4 + 64 = 68 dims)         │
-│                                                         │
-│  ④ Update MLP:    [X‖M] ──► h  (68 → 64 → 64)          │
-│     Linear → Tanh → Linear → Tanh                      │
-│                                                         │
-│  ⑤ Output head:   h ──► (ax, ay)  (64 → 2)             │
-└─────────────────────────────────────────────────────────┘
+Input:   X ∈ ℝᴺˣ⁴     node features [x, y, vx, vy] at each time step
+         Ã ∈ ℝᴺˣᴺ     row-normalised adjacency (temporal neighbourhood)
+
+① Message:    m = MLP_msg(X)              [Linear → Tanh → Linear]
+② Aggregate:  M = Ã · m                   neighbourhood average
+③ Concat:     Z = [X ‖ M]                 own features + context
+④ Update:     h = MLP_update(Z)           [Linear → Tanh → Linear → Tanh]
+⑤ Output:     (ax, ay) = W · h            predict acceleration
 ```
+
+**Why graph structure?**  
+A standard MLP sees only the instantaneous snapshot `[x, y, vx, vy]` — it cannot distinguish a point at the *start* of a sharp turn from a point at the *peak*. The graph lets each node look **±k steps** in time before predicting, giving it the context it needs to understand curvature and anticipate acceleration changes.
 
 ### Training Strategy
 
 | Aspect | Choice | Why |
 |--------|--------|-----|
-| **Supervision** | Teacher forcing | Feed ground-truth states; supervise predicted accelerations |
-| **Loss** | MSE on $(a_x, a_y)$ | Direct regression on physical quantities |
-| **Optimiser** | Adam | Adaptive learning rate, fast convergence |
-| **Scheduler** | ReduceLROnPlateau | Halves LR when loss plateaus |
-| **Early stopping** | Patience = 30 epochs | Prevents overtraining on a single trajectory |
-| **Gradient clipping** | Max norm = 1.0 | Prevents exploding gradients on sharp turns |
-| **Hardware** | CPU only | Trains in 5–15 seconds on any laptop |
+| Supervision | Teacher forcing | Feed ground-truth states, supervise accelerations |
+| Loss function | MSE on (ax, ay) | Direct regression on physical quantities |
+| Optimiser | Adam | Adaptive learning rate, fast on small datasets |
+| LR scheduler | ReduceLROnPlateau | Halves LR when progress stalls |
+| Early stopping | Patience = 30 epochs | Prevents overfitting to one trajectory |
+| Gradient clipping | Max norm = 1.0 | Stabilises training on sharp turns |
+| Hardware | CPU only | Full training in 5–15 s on any laptop |
 
-### Why a GNN and Not Just an MLP?
+### GNN → SINDy Handoff
 
-An MLP predicting acceleration from a single state vector $[x, y, v_x, v_y]$ sees only the instantaneous snapshot. It cannot distinguish between:
-- A point at the *beginning* of a sharp turn (where acceleration is about to spike)
-- A point at the *middle* of that same turn (where acceleration is at maximum)
-
-The GNN aggregates features from neighbouring time steps, giving it the context to resolve this ambiguity — exactly as a Graph Convolutional Network uses local molecular structure to predict bond energies.
-
-### GNN → SINDy Pipeline
-
-The GNN is a black box. SINDy converts it into glass:
+The GNN is a black box — high accuracy, zero interpretability. SINDy converts it to glass:
 
 ```
-Drawn path
-    │
-    ▼
-Smooth derivatives  ──►  (state, accel) pairs
-    │                           │
-    │                           ▼
-    │                    Build Θ feature library
-    │                           │
-    ▼                           ▼
-Train GNN  ──────►  Validate GNN predictions
-                           │
-                           ▼
-                    STLSQ sparse regression
-                           │
-                           ▼
-                    d²x/dt² = ...  ✓ Human-readable
-                    d²y/dt² = ...  ✓ Simulatable
-                    
+GNN predicts (ax, ay) at every time step
+       ↓
+These predictions form the regression targets
+       ↓
+STLSQ finds the sparse equation that best explains them
+       ↓
+Result: 2–6 term differential equation  ✓  interpretable  ✓  simulatable
 ```
 
 ---
 
 ## 🛡️ Safety Envelope
 
-Real drones have hard physical constraints. The app checks three at every time step:
+Three metrics are computed at every time step:
 
-### Speed
-$$v = \sqrt{v_x^2 + v_y^2}$$
-Exceeding max speed risks motor saturation and battery overload.
+| Metric | Formula | Units | Physical meaning |
+|--------|---------|-------|-----------------|
+| Speed | `v = √(vx² + vy²)` | px/s | Motor saturation / battery |
+| Acceleration | `a = √(ax² + ay²)` | px/s² | Structural stress / stall |
+| Curvature | `κ = \|vx·ay − vy·ax\| / v³` | 1/px | Turning radius (1/κ = radius) |
 
-### Acceleration Magnitude
-$$a = \sqrt{a_x^2 + a_y^2}$$
-High acceleration causes structural stress and propeller stall.
+A time step is flagged **unsafe** (red) if *any* threshold is exceeded. The Safety tab shows:
+- Percentage of the path that is unsafe — drawn vs simulated
+- Peak values of all three metrics
+- Where along the path violations occur
+- Whether the simulation produces a safer or more aggressive trajectory
 
-### Path Curvature
-$$\kappa = \frac{|v_x \, a_y - v_y \, a_x|}{(v_x^2 + v_y^2)^{3/2}}$$
+**Setting thresholds** — all units are in pixels per second, scaled to your drawing speed:
 
-This is the **signed curvature** formula from differential geometry. High curvature means a tight turn — which demands both high lateral acceleration and risks aerodynamic instability. $1/\kappa$ gives the instantaneous turning radius.
-
-A time step is flagged **unsafe** (shown in red) if *any* of the three metrics exceeds its threshold. The Safety tab reports:
-- Percentage of the total trajectory that is unsafe
-- Peak values of speed, acceleration, and curvature
-- Side-by-side comparison: is the re-simulated path safer or more aggressive than what you drew?
+| Drawing style | Speed limit | Acceleration limit |
+|--------------|------------|-------------------|
+| Slow, careful | 150–300 px/s | 500–1 000 px/s² |
+| Normal pace | 300–600 px/s | 1 000–2 500 px/s² |
+| Fast, sweeping | 600–1 500 px/s | 2 500–5 000 px/s² |
 
 ---
 
 ## 📊 Error Metrics
 
-After simulation, the app computes:
+After simulation, two metrics compare the simulated path to the drawn path:
 
-| Metric | Formula | Meaning |
-|--------|---------|---------|
-| **RMSE x** | $\sqrt{\frac{1}{N}\sum(x_i - \hat{x}_i)^2}$ | Average horizontal error |
-| **RMSE y** | $\sqrt{\frac{1}{N}\sum(y_i - \hat{y}_i)^2}$ | Average vertical error |
-| **RMSE total** | $\sqrt{\frac{1}{N}\sum\|\mathbf{p}_i - \hat{\mathbf{p}}_i\|^2}$ | Overall positional error |
-| **Hausdorff** | $\max\bigl(d_H(P,Q),\, d_H(Q,P)\bigr)$ | Worst-case deviation anywhere on path |
-
-The **Hausdorff distance** is the most conservative metric — it finds the single point where the two paths disagree the most, making it ideal for safety-critical path comparison.
-
----
-
-## 🖥️ Run Locally
-
-```bash
-# Clone the repo
-git clone https://github.com/yourusername/drone-path.git
-cd drone-path
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Launch
-streamlit run App.py
+**RMSE** — average positional error across all time-matched point pairs:
+```
+RMSE = √( (1/N) · Σ ||p_true − p_sim||² )
 ```
 
-**Requirements:** Python 3.10+, runs entirely on CPU.
+**Hausdorff Distance** — worst-case deviation anywhere along the paths:
+```
+H(P, Q) = max( max_{p∈P} min_{q∈Q} d(p,q),   max_{q∈Q} min_{p∈P} d(p,q) )
+```
+
+Hausdorff is the most conservative metric — it catches the single worst point of disagreement, making it ideal for safety-critical comparison.
 
 ---
 
 ## 📁 Project Structure
 
 ```
-drone-path/
+Drone-path/
 │
-├── App.py                  # Streamlit UI — drawing, controls, plots
-├── requirements.txt
+├── App.py                  ← Streamlit UI: drawing, controls, tabs, plots
+├── requirements.txt        ← Python dependencies
+├── LICENSE                 ← MIT
 ├── README.md
 │
 └── src/
-    ├── pipeline.py         # Arc-length resampling, SG smoothing, safety metrics
-    ├── gnn_model.py        # Temporal GNN (pure PyTorch)
-    ├── symbolic.py         # SINDy / STLSQ sparse regression
-    └── simulator.py        # RK4 integrator, RMSE, Hausdorff
+    ├── __init__.py
+    ├── pipeline.py         ← Arc-length resampling · SG smoothing · safety metrics
+    ├── gnn_model.py        ← Temporal GNN in pure PyTorch
+    ├── symbolic.py         ← SINDy wrapper + manual STLSQ · normalisation logic
+    └── simulator.py        ← RK4 integrator · normalise/de-normalise per step
 ```
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome. Here is how to get started:
+
+```bash
+# Fork the repo on GitHub, then:
+git clone https://github.com/<your-username>/Drone-path.git
+cd Drone-path
+pip install -r requirements.txt
+streamlit run App.py       # verify everything works
+```
+
+**Before submitting a pull request:**
+- Test your change with at least two different drawn paths
+- Verify that simulation still produces sensible trajectories
+- Keep changes focused — one fix or feature per PR
+
+**Good first issues to tackle:**
+- Add a screenshot/GIF to this README
+- Improve error messages for edge-case inputs
+- Add unit tests for `pipeline.py` and `symbolic.py`
+- Support drawing multiple strokes (currently only the last stroke is used)
+
+**Reporting bugs:**  
+Open a GitHub Issue with: the path you drew, the slider values used, and the error message or unexpected behaviour you saw.
+
+---
+
+## 🗺️ Roadmap
+
+Planned improvements (contributions welcome):
+
+- [ ] GPU support for larger networks
+- [ ] 3-D trajectory support (add z-axis)
+- [ ] Jerk (third derivative) as an additional safety metric
+- [ ] Export discovered equations as LaTeX
+- [ ] Side-by-side comparison of GNN vs plain MLP
+- [ ] Save and load trajectories between sessions
+- [ ] Jupyter notebook walkthroughs of each pipeline step
+
+---
+
+## ⚠️ Known Limitations
+
+- **Single trajectory** — the model learns the physics of *one* drawn path, not a general model
+- **Pixel units** — all distances are in canvas pixels, not real-world metres
+- **Simulation divergence** — highly nonlinear paths can still produce divergent simulations; try raising λ
+- **Not for production** — this is a research and educational demo, not a flight controller
 
 ---
 
 ## 📚 References
 
-| Paper | Authors | Venue |
+| Paper | Authors | Where |
 |-------|---------|-------|
-| Discovering governing equations from data by sparse identification of nonlinear dynamics | Brunton, Proctor & Kutz | *PNAS* 2016 |
-| Semi-supervised classification with graph convolutional networks | Kipf & Welling | *ICLR* 2017 |
-| Graph attention networks | Veličković et al. | *ICLR* 2018 |
-| Smoothing and differentiation of data by simplified least squares procedures | Savitzky & Golay | *Analytical Chemistry* 1964 |
-| PySINDy: A comprehensive Python package for robust sparse system identification | de Silva et al. | *JOSS* 2020 |
+| Discovering governing equations from data by sparse identification of nonlinear dynamics | Brunton, Proctor & Kutz | PNAS 2016 |
+| Semi-supervised classification with graph convolutional networks | Kipf & Welling | ICLR 2017 |
+| Graph attention networks | Veličković et al. | ICLR 2018 |
+| Smoothing and differentiation of data by simplified least squares procedures | Savitzky & Golay | Analytical Chemistry 1964 |
+| PySINDy: A comprehensive Python package for robust sparse system identification | de Silva et al. | JOSS 2020 |
+
+---
+
+## 📄 License
+
+MIT — see [LICENSE](LICENSE). Use freely, attribution appreciated.
 
 ---
 
 <div align="center">
 
-**Built with PyTorch · SINDy · Streamlit**
+Built with PyTorch · SINDy · Streamlit · Pure Python
 
 [![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://drone-path-7kpgwzdwoih9vayensxuom.streamlit.app/)
+
+*Draw → Fit → Simulate → Analyse*
 
 </div>
