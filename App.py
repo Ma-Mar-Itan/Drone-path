@@ -19,12 +19,12 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
-import numpy as np
-import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import numpy as np
+import streamlit as st
 import io
 import json
 import time
