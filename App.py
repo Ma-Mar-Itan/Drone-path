@@ -73,8 +73,8 @@ html,body,[data-testid="stAppViewContainer"]{background:#0d1117;color:#e6edf3;fo
 .pipe-step-active{background:#1c2d3d;border-color:#388bfd;box-shadow:0 0 12px rgba(56,139,253,0.2)}
 [data-testid="stTabs"] button{color:#8b949e!important;font-weight:500}
 [data-testid="stTabs"] button[aria-selected="true"]{color:#58a6ff!important;border-bottom:2px solid #388bfd!important;background:#161b22!important}
-.stButton>button{background:#21262d;border:1px solid #30363d;color:#e6edf3;border-radius:8px;font-weight:600;transition:all 0.2s}
-.stButton>button:hover{background:#30363d;border-color:#58a6ff;color:#58a6ff}
+.stButton>button{background:#21262d;border:1px solid #30363d;color:#e6edf3!important;border-radius:8px;font-weight:600;transition:all 0.2s}.stButton>button p,.stButton>button span{color:#e6edf3!important}
+.stButton>button:hover{background:#30363d;border-color:#58a6ff;color:#58a6ff!important}.stButton>button:hover p,.stButton>button:hover span{color:#58a6ff!important}
 [data-testid="stMetric"]{background:#161b22;border-radius:10px;padding:12px 16px}
 [data-testid="stMetricLabel"]{color:#8b949e!important;font-size:0.78rem!important}
 [data-testid="stMetricValue"]{color:#e6edf3!important;font-size:1.4rem!important}
@@ -275,7 +275,11 @@ if fit_btn:
     prog.progress(70, text="📝 Step 3/3 — Fitting symbolic equations (SINDy)…")
     try:
         result = fit_equations(data, threshold=sparsity)
-        sym_model, norm_stats, eq_x, eq_y, used_sindy = result
+        if len(result) == 5:
+            sym_model, norm_stats, eq_x, eq_y, used_sindy = result
+        else:
+            sym_model, eq_x, eq_y, used_sindy = result
+            norm_stats = None
         st.session_state.sym_model  = sym_model
         st.session_state.norm_stats = norm_stats
         st.session_state.eq_x = eq_x
