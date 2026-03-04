@@ -1,0 +1,3 @@
+cd "C:\Users\malek\Desktop\Projects\Highlight Extractor\Drone path\Drone-path"
+pip install -r requirements.txt
+streamlit run App.py
