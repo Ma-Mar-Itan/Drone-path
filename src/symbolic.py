@@ -1,24 +1,21 @@
 """
 src/symbolic.py
 ---------------
-Sparse symbolic regression via PySINDy to obtain interpretable equations:
+Sparse symbolic regression via SINDy to obtain interpretable equations.
 
-    d²x/dt² = f(x, y, vx, vy)
-    d²y/dt² = g(x, y, vx, vy)
+KEY FIX: All fitting and simulation is done in NORMALISED space (zero-mean,
+unit-std per feature). The normalisation stats are stored and used to:
+  1. Normalise inputs before fitting
+  2. Normalise inputs before predicting (in simulator)
+  3. De-normalise outputs back to pixel units for display
 
-We use PySINDy with a custom feature library:
-    [1, x, y, vx, vy, x², y², xy, vx², vy², vx*vy, sin(x), sin(y), cos(x), cos(y)]
-
-The threshold parameter controls sparsity (larger → fewer terms).
+This prevents the sin/cos features from wrapping at nonsensical pixel values
+and keeps all regression coefficients numerically well-conditioned.
 """
 
 import numpy as np
 from typing import Optional
 
-
-# ---------------------------------------------------------------------------
-# Feature library helpers
-# ---------------------------------------------------------------------------
 
 FEATURE_NAMES = [
     "1",
@@ -30,257 +27,208 @@ FEATURE_NAMES = [
 ]
 
 
-def build_feature_matrix(x: np.ndarray, y: np.ndarray,
-                          vx: np.ndarray, vy: np.ndarray) -> np.ndarray:
-    """
-    Build the feature matrix Θ (N × F) from state variables.
+def _compute_norm_stats(data: dict) -> dict:
+    """Compute mean and std for each state feature."""
+    stats = {}
+    for k in ["x", "y", "vx", "vy", "ax", "ay"]:
+        mu  = float(data[k].mean())
+        sig = float(data[k].std()) + 1e-8
+        stats[k] = (mu, sig)
+    return stats
 
-    Columns correspond to FEATURE_NAMES.
-    """
+
+def _normalise(data: dict, stats: dict) -> dict:
+    """Return a copy of data with state features normalised."""
+    normed = {}
+    for k in ["x", "y", "vx", "vy", "ax", "ay"]:
+        mu, sig = stats[k]
+        normed[k] = (data[k] - mu) / sig
+    normed["t"] = data["t"]
+    return normed
+
+
+def build_feature_matrix(x, y, vx, vy) -> np.ndarray:
+    """Build feature library matrix Theta (N x F) from *normalised* state."""
     ones = np.ones_like(x)
-    Theta = np.column_stack([
+    return np.column_stack([
         ones,
         x, y, vx, vy,
-        x ** 2, y ** 2, x * y,
-        vx ** 2, vy ** 2, vx * vy,
+        x**2, y**2, x*y,
+        vx**2, vy**2, vx*vy,
         np.sin(x), np.sin(y),
         np.cos(x), np.cos(y),
     ])
-    return Theta
 
 
 # ---------------------------------------------------------------------------
-# PySINDy-based fitter (preferred)
+# PySINDy wrapper
 # ---------------------------------------------------------------------------
 
-def fit_sindy(data: dict, threshold: float = 0.05) -> Optional[object]:
-    """
-    Fit a SINDy model using PySINDy.
-
-    Parameters
-    ----------
-    data      : smoothed trajectory dict (original-scale)
-    threshold : STLSQ sparsity threshold (higher → fewer terms)
-
-    Returns
-    -------
-    sindy_model or None if PySINDy unavailable
-    """
+def fit_sindy(data_norm: dict, threshold: float = 0.05):
+    """Fit SINDy on already-normalised data. Returns model or None."""
     try:
         import pysindy as ps
     except ImportError:
         return None
 
-    x = data["x"]
-    y = data["y"]
-    vx = data["vx"]
-    vy = data["vy"]
-    ax = data["ax"]
-    ay = data["ay"]
-    dt = data["t"][1] - data["t"][0]
+    x, y   = data_norm["x"],  data_norm["y"]
+    vx, vy = data_norm["vx"], data_norm["vy"]
+    ax, ay = data_norm["ax"], data_norm["ay"]
+    dt     = float(data_norm["t"][1] - data_norm["t"][0])
 
-    # State matrix: rows = samples, cols = [x, y, vx, vy]
-    # We'll treat [ax, ay] as the "derivative" of [vx, vy], so we model the
-    # second-order system as first-order on velocity.
-    # PySINDy normally differentiates X internally, but here we supply
-    # pre-computed derivatives to avoid double-differentiating.
-
-    # Build custom feature library matching FEATURE_NAMES
     feature_lib = ps.CustomLibrary(
         library_functions=[
-            lambda x, y, vx, vy: np.ones(len(x)),
-            lambda x, y, vx, vy: x,
-            lambda x, y, vx, vy: y,
-            lambda x, y, vx, vy: vx,
-            lambda x, y, vx, vy: vy,
-            lambda x, y, vx, vy: x ** 2,
-            lambda x, y, vx, vy: y ** 2,
-            lambda x, y, vx, vy: x * y,
-            lambda x, y, vx, vy: vx ** 2,
-            lambda x, y, vx, vy: vy ** 2,
-            lambda x, y, vx, vy: vx * vy,
-            lambda x, y, vx, vy: np.sin(x),
-            lambda x, y, vx, vy: np.sin(y),
-            lambda x, y, vx, vy: np.cos(x),
-            lambda x, y, vx, vy: np.cos(y),
+            lambda x,y,vx,vy: np.ones(len(x)),
+            lambda x,y,vx,vy: x,   lambda x,y,vx,vy: y,
+            lambda x,y,vx,vy: vx,  lambda x,y,vx,vy: vy,
+            lambda x,y,vx,vy: x**2,  lambda x,y,vx,vy: y**2,
+            lambda x,y,vx,vy: x*y,
+            lambda x,y,vx,vy: vx**2, lambda x,y,vx,vy: vy**2,
+            lambda x,y,vx,vy: vx*vy,
+            lambda x,y,vx,vy: np.sin(x), lambda x,y,vx,vy: np.sin(y),
+            lambda x,y,vx,vy: np.cos(x), lambda x,y,vx,vy: np.cos(y),
         ],
         function_names=[
-            lambda x, y, vx, vy: "1",
-            lambda x, y, vx, vy: "x",
-            lambda x, y, vx, vy: "y",
-            lambda x, y, vx, vy: "vx",
-            lambda x, y, vx, vy: "vy",
-            lambda x, y, vx, vy: "x^2",
-            lambda x, y, vx, vy: "y^2",
-            lambda x, y, vx, vy: "xy",
-            lambda x, y, vx, vy: "vx^2",
-            lambda x, y, vx, vy: "vy^2",
-            lambda x, y, vx, vy: "vx*vy",
-            lambda x, y, vx, vy: "sin(x)",
-            lambda x, y, vx, vy: "sin(y)",
-            lambda x, y, vx, vy: "cos(x)",
-            lambda x, y, vx, vy: "cos(y)",
+            lambda *_: "1",
+            lambda *_: "x",   lambda *_: "y",
+            lambda *_: "vx",  lambda *_: "vy",
+            lambda *_: "x^2", lambda *_: "y^2",
+            lambda *_: "xy",
+            lambda *_: "vx^2",lambda *_: "vy^2",
+            lambda *_: "vx*vy",
+            lambda *_: "sin(x)", lambda *_: "sin(y)",
+            lambda *_: "cos(x)", lambda *_: "cos(y)",
         ],
     )
 
-    # STLSQ optimizer with user-supplied threshold
     optimizer = ps.STLSQ(threshold=threshold, alpha=1e-5)
-
-    # State input for library: (N, 4) — the 4 input args above
-    U = np.stack([x, y, vx, vy], axis=1)
-
-    # Targets: acceleration (N, 2)
+    U  = np.stack([x, y, vx, vy], axis=1)
     dU = np.stack([ax, ay], axis=1)
 
-    model = ps.SINDy(
-        feature_library=feature_lib,
-        optimizer=optimizer,
-    )
-    # Fit with pre-computed derivatives (no internal differentiation)
+    model = ps.SINDy(feature_library=feature_lib, optimizer=optimizer)
     model.fit(U, t=dt, x_dot=dU)
     return model
 
 
 # ---------------------------------------------------------------------------
-# Fallback: manual sparse regression (STLSQ)
+# Manual STLSQ fallback
 # ---------------------------------------------------------------------------
 
-def _stlsq(Theta: np.ndarray, target: np.ndarray,
-            threshold: float, n_iter: int = 20) -> np.ndarray:
-    """
-    Sequential Thresholded Least Squares (STLSQ).
-
-    Iteratively zeroes out small coefficients and re-fits on active features.
-    """
-    n_features = Theta.shape[1]
+def _stlsq(Theta, target, threshold, n_iter=20):
+    n_feat = Theta.shape[1]
     coeffs = np.linalg.lstsq(Theta, target, rcond=None)[0]
-
     for _ in range(n_iter):
         active = np.abs(coeffs) > threshold
         if not active.any():
-            coeffs = np.zeros(n_features)
-            break
-        Theta_active = Theta[:, active]
-        coeffs_active = np.linalg.lstsq(Theta_active, target, rcond=None)[0]
-        coeffs = np.zeros(n_features)
-        coeffs[active] = coeffs_active
-
+            return np.zeros(n_feat)
+        c = np.linalg.lstsq(Theta[:, active], target, rcond=None)[0]
+        coeffs = np.zeros(n_feat)
+        coeffs[active] = c
     return coeffs
 
 
 class SparseEquation:
-    """
-    Holds coefficients for one equation: target = Θ · w
-    """
-
-    def __init__(self, coeffs: np.ndarray, feature_names: list[str],
-                 target_name: str):
+    def __init__(self, coeffs, feature_names, target_name):
         self.coeffs = coeffs
         self.feature_names = feature_names
         self.target_name = target_name
 
-    def __str__(self) -> str:
+    def __str__(self):
         terms = []
         for c, name in zip(self.coeffs, self.feature_names):
             if abs(c) > 1e-10:
-                if name == "1":
-                    terms.append(f"{c:+.4f}")
-                else:
-                    terms.append(f"{c:+.4f}·{name}")
-        if not terms:
-            return f"{self.target_name} = 0"
-        rhs = " ".join(terms)
-        return f"{self.target_name} = {rhs}"
+                terms.append(f"{c:+.4f}" if name == "1" else f"{c:+.4f}·{name}")
+        return f"{self.target_name} = " + (" ".join(terms) if terms else "0")
 
-    def predict(self, x, y, vx, vy) -> np.ndarray:
-        Theta = build_feature_matrix(x, y, vx, vy)
-        return Theta @ self.coeffs
+    def predict(self, x, y, vx, vy):
+        return build_feature_matrix(x, y, vx, vy) @ self.coeffs
 
 
 class ManualSINDy:
-    """Fallback sparse regression when PySINDy is unavailable."""
-
-    def __init__(self, eq_x: SparseEquation, eq_y: SparseEquation):
+    def __init__(self, eq_x, eq_y):
         self.eq_x = eq_x
         self.eq_y = eq_y
 
-    def equations_str(self) -> tuple[str, str]:
+    def equations_str(self):
         return str(self.eq_x), str(self.eq_y)
 
-    def predict(self, x, y, vx, vy) -> tuple[np.ndarray, np.ndarray]:
+    def predict(self, x, y, vx, vy):
         return self.eq_x.predict(x, y, vx, vy), self.eq_y.predict(x, y, vx, vy)
 
 
-def fit_sparse_manual(data: dict, threshold: float = 0.05) -> "ManualSINDy":
-    """
-    Fit sparse regression equations for ax and ay using STLSQ.
-    """
-    x, y, vx, vy = data["x"], data["y"], data["vx"], data["vy"]
-    ax, ay = data["ax"], data["ay"]
-
-    Theta = build_feature_matrix(x, y, vx, vy)
-    w_ax = _stlsq(Theta, ax, threshold=threshold)
-    w_ay = _stlsq(Theta, ay, threshold=threshold)
-
-    eq_x = SparseEquation(w_ax, FEATURE_NAMES, "d²x/dt²")
-    eq_y = SparseEquation(w_ay, FEATURE_NAMES, "d²y/dt²")
-    return ManualSINDy(eq_x, eq_y)
+def fit_sparse_manual(data_norm, threshold=0.05):
+    Theta = build_feature_matrix(data_norm["x"], data_norm["y"],
+                                  data_norm["vx"], data_norm["vy"])
+    w_ax = _stlsq(Theta, data_norm["ax"], threshold)
+    w_ay = _stlsq(Theta, data_norm["ay"], threshold)
+    return ManualSINDy(
+        SparseEquation(w_ax, FEATURE_NAMES, "d2x/dt2"),
+        SparseEquation(w_ay, FEATURE_NAMES, "d2y/dt2"),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Unified interface
 # ---------------------------------------------------------------------------
 
-def fit_equations(data: dict, threshold: float = 0.05) -> tuple:
+def fit_equations(data: dict, threshold: float = 0.05):
     """
-    Fit symbolic dynamics equations.
-
-    Tries PySINDy first; falls back to manual STLSQ if unavailable.
+    Normalise data, fit symbolic equations, return model + norm stats + strings.
 
     Returns
     -------
-    model      : fitted model (PySINDy model or ManualSINDy)
-    eq_str_x   : human-readable equation for d²x/dt²
-    eq_str_y   : human-readable equation for d²y/dt²
-    use_sindy  : bool — True if PySINDy was used
+    model      : fitted model
+    norm_stats : dict of (mean, std) per feature — MUST be passed to simulator
+    eq_str_x   : human-readable equation string
+    eq_str_y   : human-readable equation string
+    used_sindy : bool
     """
-    sindy_model = fit_sindy(data, threshold=threshold)
+    norm_stats  = _compute_norm_stats(data)
+    data_norm   = _normalise(data, norm_stats)
+
+    sindy_model = fit_sindy(data_norm, threshold=threshold)
 
     if sindy_model is not None:
-        # Extract equation strings from PySINDy
         try:
             eqs = sindy_model.equations()
-            # eqs[0] = d/dt(vx), eqs[1] = d/dt(vy)  i.e. ax and ay
-            eq_str_x = f"d²x/dt² = {eqs[0]}" if eqs else "d²x/dt² = (see model)"
-            eq_str_y = f"d²y/dt² = {eqs[1]}" if len(eqs) > 1 else "d²y/dt² = (see model)"
+            eq_str_x = f"d2x/dt2 (norm) = {eqs[0]}" if eqs else "d2x/dt2 = (model)"
+            eq_str_y = f"d2y/dt2 (norm) = {eqs[1]}" if len(eqs) > 1 else "d2y/dt2 = (model)"
         except Exception:
-            eq_str_x = "d²x/dt² = (PySINDy model, see console)"
-            eq_str_y = "d²y/dt² = (PySINDy model, see console)"
-        return sindy_model, eq_str_x, eq_str_y, True
+            eq_str_x = "d2x/dt2 = (PySINDy — see Training tab)"
+            eq_str_y = "d2y/dt2 = (PySINDy — see Training tab)"
+        return sindy_model, norm_stats, eq_str_x, eq_str_y, True
 
-    # Fallback
-    manual_model = fit_sparse_manual(data, threshold=threshold)
-    eq_str_x, eq_str_y = manual_model.equations_str()
-    return manual_model, eq_str_x, eq_str_y, False
+    manual = fit_sparse_manual(data_norm, threshold=threshold)
+    eq_str_x, eq_str_y = manual.equations_str()
+    return manual, norm_stats, eq_str_x, eq_str_y, False
 
 
-def predict_accelerations(model, data: dict) -> tuple[np.ndarray, np.ndarray]:
+def predict_accelerations(model, data: dict, norm_stats: dict):
     """
-    Use the fitted symbolic model to predict accelerations.
+    Predict accelerations in ORIGINAL pixel units.
 
-    Returns ax_pred, ay_pred (original units).
+    Normalises inputs → model prediction (normalised accel) → de-normalise output.
     """
-    x, y, vx, vy = data["x"], data["y"], data["vx"], data["vy"]
+    mu_x,  sig_x  = norm_stats["x"]
+    mu_y,  sig_y  = norm_stats["y"]
+    mu_vx, sig_vx = norm_stats["vx"]
+    mu_vy, sig_vy = norm_stats["vy"]
+    mu_ax, sig_ax = norm_stats["ax"]
+    mu_ay, sig_ay = norm_stats["ay"]
+
+    xn  = (data["x"]  - mu_x)  / sig_x
+    yn  = (data["y"]  - mu_y)  / sig_y
+    vxn = (data["vx"] - mu_vx) / sig_vx
+    vyn = (data["vy"] - mu_vy) / sig_vy
 
     try:
-        # PySINDy path
         import pysindy as ps
         if isinstance(model, ps.SINDy):
-            U = np.stack([x, y, vx, vy], axis=1)
-            accel = model.predict(U)
-            return accel[:, 0], accel[:, 1]
+            U = np.stack([xn, yn, vxn, vyn], axis=1)
+            pred_n = model.predict(U)
+            return pred_n[:, 0] * sig_ax + mu_ax, pred_n[:, 1] * sig_ay + mu_ay
     except Exception:
         pass
 
-    # ManualSINDy fallback
-    return model.predict(x, y, vx, vy)
+    ax_n, ay_n = model.predict(xn, yn, vxn, vyn)
+    return ax_n * sig_ax + mu_ax, ay_n * sig_ay + mu_ay
