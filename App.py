@@ -1,623 +1,552 @@
 """
-app.py
-------
-Drone Path Equation-of-Motion Demo
-===================================
-
-Draw a 2-D drone path with your mouse.  The app:
-  1. Resamples and smooths the path
-  2. Trains a small GNN over the temporal graph
-  3. Fits sparse symbolic equations via SINDy
-  4. Simulates the learned dynamics forward
-  5. Highlights unsafe segments (speed / accel / curvature)
-
-Run:
-    streamlit run app.py
+app.py  —  Drone Path Equation-of-Motion Demo
+==============================================
+Draw → GNN → SINDy → Simulate → Safety Analysis
 """
 
-import sys
-import os
+import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
 import numpy as np
 import streamlit as st
-import io
-import json
-import time
+import json, time
 
-# ── local modules ──────────────────────────────────────────────────────────
 from src.pipeline import (
-    resample_arc_length,
-    smooth_and_differentiate,
-    compute_safety_metrics,
-    safety_mask,
-    safety_summary,
+    resample_arc_length, smooth_and_differentiate,
+    compute_safety_metrics, safety_mask, safety_summary,
 )
 from src.gnn_model import train_gnn, gnn_predict
 from src.symbolic import fit_equations, predict_accelerations
 from src.simulator import simulate, compute_error_metrics
 
-# ── Streamlit page config ──────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Drone Path Dynamics",
-    page_icon="🚁",
-    layout="wide",
-)
+st.set_page_config(page_title="Drone Path · Equation Finder", page_icon="🚁", layout="wide")
 
-# ── Session state initialisation ──────────────────────────────────────────
-DEFAULTS = dict(
-    raw_xs=None, raw_ys=None,
-    data=None,
-    gnn_model=None, gnn_loss=[],
-    sym_model=None, eq_x="", eq_y="",
-    sim_data=None,
-    fitted=False,
-    simulated=False,
-)
+st.markdown("""
+<style>
+html, body, [data-testid="stAppViewContainer"] {
+    background: #0d1117; color: #e6edf3;
+    font-family: 'Inter', 'Segoe UI', sans-serif;
+}
+[data-testid="stSidebar"] { background: #161b22; border-right: 1px solid #30363d; }
+[data-testid="stSidebar"] * { color: #c9d1d9 !important; }
+.hero {
+    background: linear-gradient(135deg, #0d1117 0%, #1a2332 50%, #0d2137 100%);
+    border: 1px solid #30363d; border-radius: 16px;
+    padding: 36px 40px; margin-bottom: 24px; position: relative; overflow: hidden;
+}
+.hero::before {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(ellipse at 70% 50%, rgba(56,139,253,0.08) 0%, transparent 70%);
+}
+.hero-title {
+    font-size: 2.6rem; font-weight: 800;
+    background: linear-gradient(90deg, #58a6ff, #79c0ff, #a5d6ff);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin: 0 0 8px 0; line-height: 1.2;
+}
+.hero-sub { font-size: 1.05rem; color: #8b949e; max-width: 620px; margin: 0 0 20px 0; }
+.hero-badges { display: flex; gap: 10px; flex-wrap: wrap; }
+.badge { background: #21262d; border: 1px solid #30363d; border-radius: 20px; padding: 4px 14px; font-size: 0.78rem; color: #8b949e; font-weight: 500; }
+.badge-blue  { border-color: #388bfd44; color: #58a6ff; background: #388bfd11; }
+.badge-green { border-color: #3fb95044; color: #56d364; background: #3fb95011; }
+.badge-purple{ border-color: #bc8cff44; color: #bc8cff; background: #bc8cff11; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px 24px; margin-bottom: 16px; }
+.card-title { font-size: 0.72rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #8b949e; margin-bottom: 6px; }
+.card-value { font-size: 2rem; font-weight: 700; color: #e6edf3; }
+.card-value-sm { font-size: 1.2rem; font-weight: 600; color: #e6edf3; }
+.card-sub { font-size: 0.82rem; color: #8b949e; margin-top: 2px; }
+.eq-box {
+    background: #0d1117; border: 1px solid #388bfd44; border-left: 4px solid #388bfd;
+    border-radius: 10px; padding: 20px 24px;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+    font-size: 1.05rem; color: #79c0ff; line-height: 2; margin: 12px 0;
+}
+.eq-label { font-size: 0.72rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: #388bfd; margin-bottom: 8px; }
+.math-box { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px 20px; margin: 10px 0; font-size: 0.88rem; color: #c9d1d9; line-height: 1.7; }
+.math-formula { background: #0d1117; border-radius: 6px; padding: 8px 14px; margin: 8px 0; font-family: 'JetBrains Mono', monospace; font-size: 0.95rem; color: #a5d6ff; border-left: 3px solid #58a6ff44; }
+.step-num { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 50%; background: #388bfd22; border: 1px solid #388bfd55; color: #58a6ff; font-size: 0.78rem; font-weight: 700; margin-right: 8px; flex-shrink: 0; }
+.step-row { display: flex; align-items: flex-start; margin: 8px 0; }
+.safety-safe   { color: #56d364; font-weight: 700; font-size: 1.8rem; }
+.safety-warn   { color: #e3b341; font-weight: 700; font-size: 1.8rem; }
+.safety-danger { color: #f85149; font-weight: 700; font-size: 1.8rem; }
+.safety-bar-bg { background: #21262d; border-radius: 4px; height: 8px; margin: 6px 0; }
+.safety-bar-fill { height: 8px; border-radius: 4px; background: linear-gradient(90deg, #56d364, #e3b341, #f85149); }
+.pipeline { display: flex; align-items: center; gap: 0; overflow-x: auto; padding: 16px 0; margin: 12px 0; }
+.pipe-step { background: #21262d; border: 1px solid #30363d; border-radius: 10px; padding: 12px 16px; text-align: center; min-width: 100px; flex-shrink: 0; }
+.pipe-step-icon { font-size: 1.4rem; }
+.pipe-step-label { font-size: 0.72rem; color: #8b949e; margin-top: 4px; font-weight: 600; }
+.pipe-arrow { color: #388bfd; font-size: 1.2rem; padding: 0 6px; flex-shrink: 0; }
+.pipe-step-active { background: #1c2d3d; border-color: #388bfd; box-shadow: 0 0 12px rgba(56,139,253,0.2); }
+[data-testid="stTabs"] button { color: #8b949e !important; font-weight: 500; border-radius: 8px 8px 0 0; }
+[data-testid="stTabs"] button[aria-selected="true"] { color: #58a6ff !important; border-bottom: 2px solid #388bfd !important; background: #161b22 !important; }
+.stButton > button { background: #21262d; border: 1px solid #30363d; color: #e6edf3; border-radius: 8px; font-weight: 600; transition: all 0.2s; }
+.stButton > button:hover { background: #30363d; border-color: #58a6ff; color: #58a6ff; }
+[data-testid="stMetric"] { background: #161b22; border-radius: 10px; padding: 12px 16px; }
+[data-testid="stMetricLabel"] { color: #8b949e !important; font-size: 0.78rem !important; }
+[data-testid="stMetricValue"] { color: #e6edf3 !important; font-size: 1.5rem !important; }
+hr { border-color: #30363d !important; }
+.section-header { font-size: 1rem; font-weight: 700; color: #e6edf3; border-left: 3px solid #388bfd; padding-left: 12px; margin: 20px 0 12px 0; }
+</style>
+""", unsafe_allow_html=True)
+
+DEFAULTS = dict(raw_xs=None, raw_ys=None, data=None, gnn_model=None, gnn_loss=[], sym_model=None, eq_x="", eq_y="", sim_data=None, fitted=False, simulated=False)
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Sidebar – controls & safety panel
-# ══════════════════════════════════════════════════════════════════════════
-
 with st.sidebar:
-    st.title("🚁 Drone Path Demo")
+    st.markdown("## Configuration")
     st.markdown("---")
-
-    st.subheader("📐 Resampling")
-    N_points = st.slider("Trajectory samples (N)", 40, 200, 80, 10,
-                         help="Number of arc-length-equalised samples")
-    dt = st.slider("Time step Δt (s)", 0.01, 0.20, 0.05, 0.01,
-                   help="Seconds per sample (scales velocity/accel units)")
-
-    st.subheader("🧠 GNN Training")
+    st.markdown("**Data Pipeline**")
+    N_points = st.slider("Trajectory samples N", 40, 200, 80, 10)
+    dt = st.slider("Time step dt (s)", 0.01, 0.20, 0.05, 0.01)
+    st.markdown("**GNN**")
     epochs = st.slider("Max epochs", 100, 2000, 600, 100)
     hidden = st.slider("Hidden units", 16, 128, 64, 16)
-    k_nbrs = st.slider("k-nearest-time neighbours", 1, 5, 3)
-
-    st.subheader("📐 Symbolic Regression")
-    sparsity = st.slider("Sparsity threshold", 0.001, 0.5, 0.05, 0.001,
-                         format="%.3f",
-                         help="Higher → fewer terms in equation")
-
+    k_nbrs = st.slider("k-nearest neighbours", 1, 5, 3)
+    st.markdown("**SINDy Sparsity**")
+    sparsity = st.slider("Threshold lambda", 0.001, 0.5, 0.05, 0.001, format="%.3f")
     st.markdown("---")
-    st.subheader("🛡️ Safety Envelope")
+    st.markdown("**Safety Thresholds**")
     max_speed = st.slider("Max speed", 1.0, 50.0, 15.0, 0.5)
     max_accel = st.slider("Max acceleration", 1.0, 100.0, 30.0, 1.0)
-    max_curv  = st.slider("Max curvature", 0.001, 0.5, 0.05, 0.001,
-                           format="%.3f")
-
+    max_curv  = st.slider("Max curvature", 0.001, 0.5, 0.05, 0.001, format="%.3f")
     st.markdown("---")
-    st.subheader("ℹ️ About")
-    st.markdown(
-        """
-        **Graph** = nodes are time-steps; edges connect temporal neighbours.
-        
-        **GNN** learns acceleration from local spatio-temporal context.
-        
-        **SINDy** fits sparse polynomial/trig equations to the GNN-identified dynamics.
-        
-        **Safe envelope** flags where speed, acceleration, or path curvature exceeds thresholds.
-        """
-    )
+    st.markdown("""<div style='font-size:0.78rem;color:#8b949e;line-height:1.7'>
+<b style='color:#58a6ff'>Graph</b> — nodes=time steps; edges=temporal neighbours<br>
+<b style='color:#58a6ff'>GNN</b> — message passing to predict acceleration<br>
+<b style='color:#58a6ff'>SINDy</b> — sparse regression to readable equation<br>
+<b style='color:#58a6ff'>RK4</b> — integrate equations forward in time</div>""", unsafe_allow_html=True)
 
+st.markdown("""
+<div class="hero">
+  <div class="hero-title">Drone Path · Equation Finder</div>
+  <div class="hero-sub">Draw a 2-D drone trajectory. A Graph Neural Network learns its physics in seconds.
+  Sparse symbolic regression distils it into human-readable equations of motion. Re-fly the path. Analyse safety.</div>
+  <div class="hero-badges">
+    <span class="badge badge-blue">Graph Neural Network</span>
+    <span class="badge badge-green">SINDy Symbolic Regression</span>
+    <span class="badge badge-purple">RK4 Simulation</span>
+    <span class="badge">Safety Analysis</span>
+    <span class="badge">CPU Only</span>
+  </div>
+</div>""", unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════
-# Main layout
-# ══════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="pipeline">
+  <div class="pipe-step pipe-step-active"><div class="pipe-step-icon">✏️</div><div class="pipe-step-label">Draw Path</div></div>
+  <div class="pipe-arrow">→</div>
+  <div class="pipe-step"><div class="pipe-step-icon">📐</div><div class="pipe-step-label">Resample &amp; Smooth</div></div>
+  <div class="pipe-arrow">→</div>
+  <div class="pipe-step"><div class="pipe-step-icon">🕸️</div><div class="pipe-step-label">Temporal Graph</div></div>
+  <div class="pipe-arrow">→</div>
+  <div class="pipe-step"><div class="pipe-step-icon">🧠</div><div class="pipe-step-label">Train GNN</div></div>
+  <div class="pipe-arrow">→</div>
+  <div class="pipe-step"><div class="pipe-step-icon">📝</div><div class="pipe-step-label">SINDy Equations</div></div>
+  <div class="pipe-arrow">→</div>
+  <div class="pipe-step"><div class="pipe-step-icon">▶️</div><div class="pipe-step-label">RK4 Simulate</div></div>
+  <div class="pipe-arrow">→</div>
+  <div class="pipe-step"><div class="pipe-step-icon">🛡️</div><div class="pipe-step-label">Safety Check</div></div>
+</div>""", unsafe_allow_html=True)
 
-st.title("✈️ Drone Path Equation-of-Motion Finder")
-st.markdown(
-    "Draw a drone path below, then hit **Fit Model** to learn its dynamics and "
-    "**Simulate** to re-fly it from the learned equations."
-)
-
-# ── Drawing canvas ─────────────────────────────────────────────────────────
-col_canvas, col_info = st.columns([2, 1])
-
+col_canvas, col_ctrl = st.columns([3, 1])
 with col_canvas:
-    st.subheader("🖊️ Draw your path")
-    st.markdown("Click and drag to draw a continuous drone trajectory.")
-
+    st.markdown('<div class="section-header">✏️ Draw Your Trajectory</div>', unsafe_allow_html=True)
+    st.markdown("<small style='color:#8b949e'>Click and drag to sketch a drone flight path</small>", unsafe_allow_html=True)
     try:
         from streamlit_drawable_canvas import st_canvas
-
-        canvas_result = st_canvas(
-            fill_color="rgba(0,0,0,0)",
-            stroke_width=3,
-            stroke_color="#1E88E5",
-            background_color="#F8F9FA",
-            height=420,
-            width=620,
-            drawing_mode="freedraw",
-            key="canvas",
-        )
-
-        # Extract strokes from canvas JSON
+        canvas_result = st_canvas(fill_color="rgba(0,0,0,0)", stroke_width=3, stroke_color="#388bfd",
+            background_color="#f0f4f8", height=380, width=680, drawing_mode="freedraw", key="canvas")
         if canvas_result.json_data is not None:
-            objects = canvas_result.json_data.get("objects", [])
             all_xs, all_ys = [], []
-            for obj in objects:
+            for obj in canvas_result.json_data.get("objects", []):
                 if obj.get("type") == "path":
-                    path_data = obj.get("path", [])
-                    for cmd in path_data:
-                        if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] in ("M", "L", "Q"):
-                            all_xs.append(float(cmd[1]))
-                            all_ys.append(float(cmd[2]))
-
+                    for cmd in obj.get("path", []):
+                        if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] in ("M","L","Q"):
+                            all_xs.append(float(cmd[1])); all_ys.append(float(cmd[2]))
             if len(all_xs) > 5:
                 st.session_state.raw_xs = np.array(all_xs)
                 st.session_state.raw_ys = np.array(all_ys)
-
-        canvas_available = True
-
     except ImportError:
-        canvas_available = False
-        st.warning(
-            "⚠️ `streamlit-drawable-canvas` not installed. "
-            "Using a sample trajectory instead.\n\n"
-            "Install with: `pip install streamlit-drawable-canvas`"
-        )
-        # Provide a sample figure-8 trajectory
-        t_sample = np.linspace(0, 2 * np.pi, 300)
-        all_xs_s = 200 + 150 * np.sin(t_sample)
-        all_ys_s = 200 + 80  * np.sin(2 * t_sample)
-        st.session_state.raw_xs = all_xs_s
-        st.session_state.raw_ys = all_ys_s
-        st.info("Using built-in figure-8 sample path.")
+        t_s = np.linspace(0, 2*np.pi, 300)
+        st.session_state.raw_xs = 200 + 150*np.sin(t_s)
+        st.session_state.raw_ys = 200 + 80*np.sin(2*t_s)
+        st.info("Using built-in figure-8 demo (install streamlit-drawable-canvas for mouse drawing)")
 
-
-with col_info:
-    st.subheader("📊 Path Status")
+with col_ctrl:
+    st.markdown('<div class="section-header">Path Info</div>', unsafe_allow_html=True)
     if st.session_state.raw_xs is not None:
         n_raw = len(st.session_state.raw_xs)
-        st.metric("Raw points", n_raw)
-        x_range = st.session_state.raw_xs.max() - st.session_state.raw_xs.min()
-        y_range = st.session_state.raw_ys.max() - st.session_state.raw_ys.min()
-        st.metric("X range (px)", f"{x_range:.0f}")
-        st.metric("Y range (px)", f"{y_range:.0f}")
+        xr = st.session_state.raw_xs.max() - st.session_state.raw_xs.min()
+        yr = st.session_state.raw_ys.max() - st.session_state.raw_ys.min()
+        st.markdown(f"""<div class="card"><div class="card-title">Raw points</div><div class="card-value">{n_raw}</div></div>
+<div class="card"><div class="card-title">X span (px)</div><div class="card-value-sm">{xr:.0f}</div></div>
+<div class="card"><div class="card-title">Y span (px)</div><div class="card-value-sm">{yr:.0f}</div></div>""", unsafe_allow_html=True)
     else:
-        st.info("No path drawn yet.")
-
-    st.markdown("---")
-    # Action buttons
-    btn_col1, btn_col2 = st.columns(2)
-    with btn_col1:
-        fit_btn = st.button("🔧 Fit Model", type="primary", use_container_width=True)
-    with btn_col2:
-        sim_btn = st.button("▶️ Simulate", use_container_width=True)
-
-    clear_btn = st.button("🗑️ Clear", use_container_width=True)
-    export_btn = st.button("💾 Export Data", use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Clear
-# ══════════════════════════════════════════════════════════════════════════
+        st.markdown('<div class="card"><div class="card-sub">No path drawn yet</div></div>', unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+    fit_btn    = st.button("🔧 Fit Model",   type="primary", use_container_width=True)
+    sim_btn    = st.button("▶️ Simulate",    use_container_width=True)
+    clear_btn  = st.button("🗑️ Clear",       use_container_width=True)
+    export_btn = st.button("💾 Export JSON", use_container_width=True)
 
 if clear_btn:
-    for k, v in DEFAULTS.items():
-        st.session_state[k] = v
+    for k, v in DEFAULTS.items(): st.session_state[k] = v
     st.rerun()
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Fit Model
-# ══════════════════════════════════════════════════════════════════════════
-
 if fit_btn:
-    raw_xs = st.session_state.raw_xs
-    raw_ys = st.session_state.raw_ys
-
-    if raw_xs is None or len(raw_xs) < 10:
+    if st.session_state.raw_xs is None or len(st.session_state.raw_xs) < 10:
         st.error("Please draw a path with at least 10 points first.")
     else:
-        with st.spinner("📐 Resampling and smoothing…"):
-            try:
-                xs_r, ys_r = resample_arc_length(raw_xs, raw_ys, N=N_points)
-                data = smooth_and_differentiate(xs_r, ys_r, dt=dt)
-                st.session_state.data = data
-            except Exception as e:
-                st.error(f"Pipeline error: {e}")
-                st.stop()
-
-        with st.spinner(f"🧠 Training GNN ({epochs} max epochs)…"):
-            try:
-                t0 = time.time()
-                gnn_model, loss_hist, x_mu, x_std, y_mu, y_std = train_gnn(
-                    data, epochs=epochs, hidden=hidden, k_neighbors=k_nbrs
-                )
-                elapsed = time.time() - t0
-                st.session_state.gnn_model = (gnn_model, x_mu, x_std, y_mu, y_std)
-                st.session_state.gnn_loss = loss_hist
-                st.success(f"✅ GNN trained in {elapsed:.1f}s ({len(loss_hist)} epochs), "
-                           f"final loss: {loss_hist[-1]:.5f}")
-            except Exception as e:
-                st.error(f"GNN training error: {e}")
-                st.stop()
-
-        with st.spinner("📐 Fitting symbolic equations (SINDy)…"):
-            try:
-                sym_model, eq_x, eq_y, used_sindy = fit_equations(data, threshold=sparsity)
-                st.session_state.sym_model = sym_model
-                st.session_state.eq_x = eq_x
-                st.session_state.eq_y = eq_y
-                backend = "PySINDy" if used_sindy else "Manual STLSQ"
-                st.success(f"✅ Symbolic regression done ({backend})")
-            except Exception as e:
-                st.error(f"Symbolic regression error: {e}")
-                st.stop()
-
-        st.session_state.fitted = True
-        st.session_state.simulated = False
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Simulate
-# ══════════════════════════════════════════════════════════════════════════
+        prog = st.progress(0, text="Resampling and smoothing...")
+        try:
+            xs_r, ys_r = resample_arc_length(st.session_state.raw_xs, st.session_state.raw_ys, N=N_points)
+            data = smooth_and_differentiate(xs_r, ys_r, dt=dt)
+            st.session_state.data = data
+        except Exception as e:
+            st.error(f"Pipeline error: {e}"); st.stop()
+        prog.progress(25, text="Training GNN...")
+        try:
+            t0 = time.time()
+            gnn_model, loss_hist, x_mu, x_std, y_mu, y_std = train_gnn(data, epochs=epochs, hidden=hidden, k_neighbors=k_nbrs)
+            elapsed = time.time() - t0
+            st.session_state.gnn_model = (gnn_model, x_mu, x_std, y_mu, y_std)
+            st.session_state.gnn_loss  = loss_hist
+        except Exception as e:
+            st.error(f"GNN error: {e}"); st.stop()
+        prog.progress(70, text="Fitting symbolic equations (SINDy)...")
+        try:
+            sym_model, eq_x, eq_y, used_sindy = fit_equations(data, threshold=sparsity)
+            st.session_state.sym_model = sym_model
+            st.session_state.eq_x = eq_x; st.session_state.eq_y = eq_y
+        except Exception as e:
+            st.error(f"SINDy error: {e}"); st.stop()
+        prog.progress(100, text="Done!"); time.sleep(0.4); prog.empty()
+        backend = "PySINDy" if used_sindy else "Manual STLSQ"
+        st.success(f"Model fitted in {elapsed:.1f}s · {len(loss_hist)} epochs · Loss: {loss_hist[-1]:.5f} · Backend: {backend}")
+        st.session_state.fitted = True; st.session_state.simulated = False
 
 if sim_btn:
     if not st.session_state.fitted:
         st.warning("Fit the model first.")
     else:
-        data = st.session_state.data
-        sym_model = st.session_state.sym_model
-
-        with st.spinner("▶️ Simulating trajectory…"):
+        with st.spinner("Integrating equations forward (RK4)..."):
+            data = st.session_state.data
+            x0, y0 = float(data["x"][0]), float(data["y"][0])
+            vx0, vy0 = float(data["vx"][0]), float(data["vy"][0])
+            dt_val = float(data["t"][1] - data["t"][0])
             try:
-                x0, y0 = float(data["x"][0]), float(data["y"][0])
-                vx0, vy0 = float(data["vx"][0]), float(data["vy"][0])
-                N = len(data["x"])
-                dt_val = float(data["t"][1] - data["t"][0])
-                sim_data = simulate(sym_model, x0, y0, vx0, vy0, dt=dt_val, N=N)
-                st.session_state.sim_data = sim_data
-                st.session_state.simulated = True
-                st.success("✅ Simulation complete")
+                sim_data = simulate(st.session_state.sym_model, x0, y0, vx0, vy0, dt=dt_val, N=len(data["x"]))
+                st.session_state.sim_data = sim_data; st.session_state.simulated = True
+                st.success("Simulation complete")
             except Exception as e:
                 st.error(f"Simulation error: {e}")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Export
-# ══════════════════════════════════════════════════════════════════════════
 
 if export_btn:
     if st.session_state.data is None:
         st.warning("No data to export yet.")
     else:
         data = st.session_state.data
-        export = {
-            "trajectory": {
-                "x": data["x"].tolist(),
-                "y": data["y"].tolist(),
-                "vx": data["vx"].tolist(),
-                "vy": data["vy"].tolist(),
-                "ax": data["ax"].tolist(),
-                "ay": data["ay"].tolist(),
-                "t": data["t"].tolist(),
-            },
-            "equations": {
-                "ax": st.session_state.eq_x,
-                "ay": st.session_state.eq_y,
-            },
-        }
-        json_str = json.dumps(export, indent=2)
-        st.download_button(
-            "⬇️ Download JSON",
-            data=json_str,
-            file_name="drone_path.json",
-            mime="application/json",
-        )
+        payload = {"trajectory": {k: data[k].tolist() for k in ["x","y","vx","vy","ax","ay","t"]},
+                   "equations": {"ax": st.session_state.eq_x, "ay": st.session_state.eq_y}}
+        st.download_button("Download JSON", json.dumps(payload, indent=2), "drone_path.json", "application/json")
 
+DARK_BG="#0d1117"; DARK_AX="#161b22"; GRID_COL="#21262d"
+SAFE_COL="#388bfd"; UNSAFE_C="#f85149"; SIM_SAFE="#3fb950"; SIM_UNSA="#e3b341"
+TEXT_COL="#e6edf3"; MUTED="#8b949e"
 
-# ══════════════════════════════════════════════════════════════════════════
-# Plotting
-# ══════════════════════════════════════════════════════════════════════════
+def _style_ax(ax, title="", xlabel="", ylabel=""):
+    ax.set_facecolor(DARK_AX)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.xaxis.label.set_color(MUTED); ax.yaxis.label.set_color(MUTED)
+    for spine in ax.spines.values(): spine.set_edgecolor(GRID_COL)
+    ax.grid(True, color=GRID_COL, linewidth=0.7, alpha=0.8)
+    if title:  ax.set_title(title, fontsize=10, fontweight="bold", color=TEXT_COL, pad=8)
+    if xlabel: ax.set_xlabel(xlabel, fontsize=8)
+    if ylabel: ax.set_ylabel(ylabel, fontsize=8)
 
-def plot_path_with_safety(
-    data,
-    unsafe,
-    sim_data=None,
-    sim_unsafe=None,
-    title="Trajectory",
-) -> plt.Figure:
-    """Render the trajectory with unsafe segments highlighted in red."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.set_facecolor("#F0F4F8")
-    fig.patch.set_facecolor("#FFFFFF")
-
-    x, y = data["x"], data["y"]
-    N = len(x)
-
-    # Draw resampled path segment-by-segment
-    for i in range(N - 1):
-        color = "#E53935" if unsafe[i] else "#1E88E5"
-        lw = 2.5 if unsafe[i] else 1.8
-        ax.plot(x[i:i+2], y[i:i+2], color=color, linewidth=lw, zorder=3)
-
-    # Start / end markers
-    ax.scatter([x[0]], [y[0]], c="green", s=100, zorder=5, label="Start")
-    ax.scatter([x[-1]], [y[-1]], c="purple", s=100, marker="*", zorder=5, label="End")
-
-    # Simulated path overlay
+def plot_trajectory(data, unsafe, sim_data=None, sim_unsafe=None):
+    fig, ax = plt.subplots(figsize=(9, 5.5)); fig.patch.set_facecolor(DARK_BG)
+    _style_ax(ax, "Trajectory  (blue=safe  red=unsafe  dashed=simulated)", "x (pixels)", "y (pixels)")
+    x, y, N = data["x"], data["y"], len(data["x"])
+    for i in range(N-1):
+        ax.plot(x[i:i+2], y[i:i+2], color=UNSAFE_C if unsafe[i] else SAFE_COL, lw=2.2, solid_capstyle="round", zorder=3)
+    cmap = plt.cm.cool
+    for i in range(0, N, max(1, N//25)):
+        c = mcolors.to_rgba(cmap(i/N), alpha=0.7)
+        ax.scatter(x[i], y[i], color=[c], s=18, zorder=5, edgecolors="none")
+    ax.scatter([x[0]], [y[0]], color="#56d364", s=120, zorder=7, label="Start")
+    ax.scatter([x[-1]], [y[-1]], color="#bc8cff", s=140, zorder=7, label="End", marker="*")
     if sim_data is not None:
-        sx, sy = sim_data["x"], sim_data["y"]
-        M = len(sx)
-        if sim_unsafe is not None:
-            for i in range(min(M - 1, len(sim_unsafe) - 1)):
-                color = "#FF6F00" if sim_unsafe[i] else "#43A047"
-                ax.plot(sx[i:i+2], sy[i:i+2], color=color, linewidth=1.5,
-                        linestyle="--", zorder=4)
-        else:
-            ax.plot(sx, sy, "--", color="#43A047", linewidth=1.5, zorder=4,
-                    label="Simulated")
-
-    # Legend patches
-    patches = [
-        mpatches.Patch(color="#1E88E5", label="Drawn (safe)"),
-        mpatches.Patch(color="#E53935", label="Drawn (unsafe)"),
-    ]
+        sx, sy = sim_data["x"], sim_data["y"]; M = len(sx)
+        su = sim_unsafe if sim_unsafe is not None else np.zeros(M, dtype=bool)
+        for i in range(min(M-1, len(su)-1)):
+            ax.plot(sx[i:i+2], sy[i:i+2], color=SIM_UNSA if su[i] else SIM_SAFE, lw=1.8, ls="--", alpha=0.85, zorder=4)
+    patches = [mpatches.Patch(color=SAFE_COL,label="Drawn (safe)"), mpatches.Patch(color=UNSAFE_C,label="Drawn (unsafe)")]
     if sim_data is not None:
-        patches += [
-            mpatches.Patch(color="#43A047", label="Simulated (safe)"),
-            mpatches.Patch(color="#FF6F00", label="Simulated (unsafe)"),
-        ]
-    patches += [
-        mpatches.Patch(color="green", label="Start"),
-        mpatches.Patch(color="purple", label="End"),
-    ]
-    ax.legend(handles=patches, loc="upper right", fontsize=8)
+        patches += [mpatches.Patch(color=SIM_SAFE,label="Simulated (safe)"), mpatches.Patch(color=SIM_UNSA,label="Simulated (unsafe)")]
+    patches += [mpatches.Patch(color="#56d364",label="Start"), mpatches.Patch(color="#bc8cff",label="End")]
+    ax.legend(handles=patches, loc="upper right", fontsize=7.5, facecolor="#161b22", edgecolor="#30363d", labelcolor=TEXT_COL)
+    ax.set_aspect("equal", adjustable="datalim"); plt.tight_layout(pad=1.5); return fig
 
-    # Time index colouring strip (small dots)
-    cmap = plt.cm.viridis
-    for i in range(0, N, max(1, N // 20)):
-        ax.scatter(x[i], y[i], c=[i / N], cmap=cmap, vmin=0, vmax=1,
-                   s=20, zorder=6, alpha=0.6)
-
-    ax.set_title(title, fontsize=13, fontweight="bold")
-    ax.set_xlabel("x (pixels)")
-    ax.set_ylabel("y (pixels)")
-    ax.grid(True, alpha=0.3)
-    ax.set_aspect("equal")
-    plt.tight_layout()
-    return fig
-
-
-def plot_metrics(data, metrics, title="Safety Metrics") -> plt.Figure:
-    """Plot speed, accel, curvature over time with threshold lines."""
+def plot_accelerations(data, ax_gnn, ay_gnn, ax_sym, ay_sym):
+    fig, axs = plt.subplots(2, 1, figsize=(9, 4.5), sharex=True); fig.patch.set_facecolor(DARK_BG)
     t = data["t"]
-    fig, axes = plt.subplots(3, 1, figsize=(8, 5), sharex=True)
-    fig.patch.set_facecolor("#FFFFFF")
+    for ax_plot, truth, gnn_v, sym_v, lbl in [(axs[0],data["ax"],ax_gnn,ax_sym,"d2x/dt2 (ax)"),(axs[1],data["ay"],ay_gnn,ay_sym,"d2y/dt2 (ay)")]:
+        _style_ax(ax_plot, ylabel=lbl)
+        ax_plot.plot(t, truth, color=TEXT_COL, lw=1.6, label="Ground truth (SG)", zorder=4)
+        if gnn_v is not None: ax_plot.plot(t, gnn_v, "--", color="#58a6ff", lw=1.3, alpha=0.9, label="GNN", zorder=3)
+        if sym_v is not None: ax_plot.plot(t, sym_v, ":", color="#f78166", lw=1.8, label="SINDy", zorder=5)
+        ax_plot.legend(fontsize=7.5, facecolor="#161b22", edgecolor="#30363d", labelcolor=TEXT_COL)
+    axs[-1].set_xlabel("time (s)", fontsize=8, color=MUTED)
+    fig.suptitle("Acceleration Predictions — Ground Truth vs GNN vs SINDy", fontsize=10, fontweight="bold", color=TEXT_COL, y=1.01)
+    plt.tight_layout(pad=1.2); return fig
 
-    series = [
-        (metrics["speed"],     "Speed",        "#1565C0", max_speed),
-        (metrics["accel_mag"], "Accel (mag)",   "#6A1B9A", max_accel),
-        (metrics["curvature"], "Curvature",     "#2E7D32", max_curv),
-    ]
-    for ax, (vals, label, color, thresh) in zip(axes, series):
-        ax.plot(t, vals, color=color, linewidth=1.5)
-        ax.axhline(thresh, color="red", linestyle="--", linewidth=1, label=f"limit={thresh:.3g}")
-        ax.fill_between(t, vals, thresh, where=(vals > thresh),
-                        color="red", alpha=0.25)
-        ax.set_ylabel(label, fontsize=9)
-        ax.legend(fontsize=8, loc="upper right")
-        ax.grid(True, alpha=0.3)
-        ax.set_facecolor("#F9F9F9")
+def plot_safety_metrics(data, metrics, title="Safety Metrics"):
+    fig, axes = plt.subplots(3, 1, figsize=(9, 5), sharex=True); fig.patch.set_facecolor(DARK_BG)
+    t = data["t"]
+    for ax, (vals, label, color, thresh) in zip(axes, [
+        (metrics["speed"],     "Speed  v = sqrt(vx2+vy2)",          "#58a6ff", max_speed),
+        (metrics["accel_mag"], "Acceleration  a = sqrt(ax2+ay2)",    "#bc8cff", max_accel),
+        (metrics["curvature"], "Curvature  k = |vx*ay-vy*ax| / v3", "#3fb950", max_curv),
+    ]):
+        _style_ax(ax, ylabel=label)
+        ax.plot(t, vals, color=color, lw=1.5, zorder=3)
+        ax.axhline(thresh, color=UNSAFE_C, ls="--", lw=1.2, label=f"limit={thresh:.3g}", zorder=4)
+        ax.fill_between(t, vals, thresh, where=(vals>thresh), color=UNSAFE_C, alpha=0.18, zorder=2)
+        ax.legend(fontsize=7.5, facecolor="#161b22", edgecolor="#30363d", labelcolor=TEXT_COL)
+    axes[-1].set_xlabel("time (s)", fontsize=8, color=MUTED)
+    fig.suptitle(title, fontsize=10, fontweight="bold", color=TEXT_COL, y=1.01)
+    plt.tight_layout(pad=1.2); return fig
 
-    axes[-1].set_xlabel("time (s)")
-    fig.suptitle(title, fontsize=12, fontweight="bold")
-    plt.tight_layout()
-    return fig
-
-
-def plot_loss(loss_hist) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(5, 2.5))
-    ax.semilogy(loss_hist, color="#1E88E5", linewidth=1.5)
-    ax.set_title("GNN Training Loss", fontsize=11)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("MSE (log)")
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    return fig
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Main display area (only shown after fitting)
-# ══════════════════════════════════════════════════════════════════════════
+def plot_loss(loss_hist):
+    fig, ax = plt.subplots(figsize=(7, 2.8)); fig.patch.set_facecolor(DARK_BG)
+    _style_ax(ax, "GNN Training Loss", "Epoch", "MSE (log)")
+    ax.semilogy(loss_hist, color="#58a6ff", lw=1.5)
+    ax.fill_between(range(len(loss_hist)), loss_hist, alpha=0.15, color="#58a6ff")
+    plt.tight_layout(pad=1.2); return fig
 
 if st.session_state.fitted and st.session_state.data is not None:
-    data = st.session_state.data
-
-    # Safety metrics for drawn path
+    data    = st.session_state.data
     metrics = compute_safety_metrics(data)
-    unsafe = safety_mask(metrics, max_speed, max_accel, max_curv)
+    unsafe  = safety_mask(metrics, max_speed, max_accel, max_curv)
     summary = safety_summary(metrics, unsafe)
-
-    # Safety metrics for simulated path (if available)
-    sim_data = st.session_state.sim_data if st.session_state.simulated else None
+    sim_data    = st.session_state.sim_data if st.session_state.simulated else None
     sim_metrics = compute_safety_metrics(sim_data) if sim_data else None
-    sim_unsafe = safety_mask(sim_metrics, max_speed, max_accel, max_curv) if sim_metrics else None
+    sim_unsafe  = safety_mask(sim_metrics, max_speed, max_accel, max_curv) if sim_metrics else None
     sim_summary = safety_summary(sim_metrics, sim_unsafe) if sim_metrics else None
 
-    # ── Tab layout ─────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["🛤️ Trajectory", "📐 Equations", "🛡️ Safety", "📈 Training"]
-    )
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🛤️ Trajectory", "📝 Equations & Math", "🛡️ Safety", "📈 Training", "🔬 How It Works"])
 
-    # ── Tab 1: Trajectory ──────────────────────────────────────────────────
     with tab1:
-        fig_path = plot_path_with_safety(
-            data, unsafe,
-            sim_data=sim_data,
-            sim_unsafe=sim_unsafe,
-            title="Drawn Path (blue=safe, red=unsafe) + Simulated (dashed)",
-        )
-        st.pyplot(fig_path, use_container_width=True)
-        plt.close(fig_path)
-
+        fig_p = plot_trajectory(data, unsafe, sim_data, sim_unsafe)
+        st.pyplot(fig_p, use_container_width=True); plt.close(fig_p)
         if sim_data is not None:
-            err = compute_error_metrics(
-                data["x"], data["y"], sim_data["x"], sim_data["y"]
-            )
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("RMSE (x)", f"{err['rmse_x']:.2f}")
-            c2.metric("RMSE (y)", f"{err['rmse_y']:.2f}")
-            c3.metric("RMSE (total)", f"{err['rmse_total']:.2f}")
-            c4.metric("Hausdorff", f"{err['hausdorff']:.2f}")
-
-    # ── Tab 2: Equations ───────────────────────────────────────────────────
-    with tab2:
-        st.subheader("Learned Equations of Motion")
-        st.markdown("These equations approximate the **acceleration dynamics** of the drawn path:")
-
-        eq_box_style = (
-            "background:#1E1E2E;color:#CDD6F4;padding:16px;"
-            "border-radius:8px;font-family:monospace;font-size:15px;"
-        )
-        st.markdown(
-            f'<div style="{eq_box_style}">'
-            f"{st.session_state.eq_x}<br><br>"
-            f"{st.session_state.eq_y}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("---")
-        st.subheader("GNN vs SINDy Acceleration Predictions")
-
-        # Plot GNN predictions vs ground truth vs SINDy
-        gnn_pack = st.session_state.gnn_model
-        if gnn_pack is not None:
-            gnn_model, x_mu, x_std, y_mu, y_std = gnn_pack
-            ax_gnn, ay_gnn = gnn_predict(gnn_model, data, x_mu, x_std, y_mu, y_std)
+            err = compute_error_metrics(data["x"], data["y"], sim_data["x"], sim_data["y"])
+            st.markdown('<div class="section-header">Simulation Error Metrics</div>', unsafe_allow_html=True)
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("RMSE x",     f"{err['rmse_x']:.2f} px")
+            c2.metric("RMSE y",     f"{err['rmse_y']:.2f} px")
+            c3.metric("RMSE total", f"{err['rmse_total']:.2f} px")
+            c4.metric("Hausdorff",  f"{err['hausdorff']:.2f} px")
+            st.markdown("""<div class="math-box">
+<b style="color:#58a6ff">RMSE</b> — Root Mean Square Error between time-matched points:<br>
+<div class="math-formula">RMSE = sqrt( (1/N) * sum( ||p_true - p_sim||^2 ) )</div>
+<b style="color:#58a6ff">Hausdorff Distance</b> — worst-case deviation anywhere on the path:<br>
+<div class="math-formula">H(P,Q) = max( max_p min_q d(p,q),  max_q min_p d(p,q) )</div>
+Hausdorff catches the single worst point of disagreement between drawn and simulated paths.
+</div>""", unsafe_allow_html=True)
         else:
-            ax_gnn = ay_gnn = None
+            st.info("Click Simulate to overlay the re-flown trajectory and see error metrics.")
 
-        sym_model = st.session_state.sym_model
-        try:
-            ax_sym, ay_sym = predict_accelerations(sym_model, data)
-        except Exception:
-            ax_sym = ay_sym = None
+    with tab2:
+        st.markdown('<div class="section-header">Learned Equations of Motion</div>', unsafe_allow_html=True)
+        st.markdown("""<div class="math-box">These equations describe how the drone <b>accelerates</b> as a function of its current position and velocity.
+They were discovered automatically from your drawing using <b>SINDy (Sparse Identification of Nonlinear Dynamics)</b>.</div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="eq-label">Equations of Motion — discovered from your trajectory</div>
+<div class="eq-box">{st.session_state.eq_x}<br>{st.session_state.eq_y}</div>""", unsafe_allow_html=True)
+        st.markdown("""<div class="math-box">
+<b style="color:#58a6ff">Feature Library Theta</b> — candidate basis functions:<br>
+<div class="math-formula">Theta = [ 1 | x | y | vx | vy | x^2 | y^2 | xy | vx^2 | vy^2 | vx*vy | sin(x) | sin(y) | cos(x) | cos(y) ]</div>
+SINDy solves:  <span style="color:#a5d6ff">ax = Theta * w_x</span>  and  <span style="color:#a5d6ff">ay = Theta * w_y</span>
+subject to <b>w being sparse</b> — most coefficients zeroed by thresholding.<br>
+Higher sparsity lambda = simpler equations with fewer terms.
+</div>""", unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Acceleration Predictions — Ground Truth vs GNN vs SINDy</div>', unsafe_allow_html=True)
+        ax_gnn = ay_gnn = ax_sym = ay_sym = None
+        if st.session_state.gnn_model:
+            gnn_model, x_mu, x_std, y_mu, y_std = st.session_state.gnn_model
+            ax_gnn, ay_gnn = gnn_predict(gnn_model, data, x_mu, x_std, y_mu, y_std)
+        try: ax_sym, ay_sym = predict_accelerations(st.session_state.sym_model, data)
+        except: pass
+        fig_acc = plot_accelerations(data, ax_gnn, ay_gnn, ax_sym, ay_sym)
+        st.pyplot(fig_acc, use_container_width=True); plt.close(fig_acc)
+        st.markdown("""<div class="math-box">
+<b>Ground truth</b> — accelerations from Savitzky-Golay polynomial fit (analytically differentiated).<br>
+<b>GNN</b> — predictions from the trained Graph Neural Network (black-box, high accuracy).<br>
+<b>SINDy</b> — predictions from the sparse symbolic equation (interpretable, trades accuracy for simplicity).
+</div>""", unsafe_allow_html=True)
 
-        t = data["t"]
-
-        fig_acc, axs = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
-        fig_acc.patch.set_facecolor("#FFFFFF")
-
-        for ax_plot, true_vals, gnn_vals, sym_vals, lbl in [
-            (axs[0], data["ax"], ax_gnn, ax_sym, "ax (d²x/dt²)"),
-            (axs[1], data["ay"], ay_gnn, ay_sym, "ay (d²y/dt²)"),
-        ]:
-            ax_plot.plot(t, true_vals, color="#333", linewidth=1.5, label="Ground truth")
-            if gnn_vals is not None:
-                ax_plot.plot(t, gnn_vals, "--", color="#1E88E5", linewidth=1.2, label="GNN")
-            if sym_vals is not None:
-                ax_plot.plot(t, sym_vals, ":", color="#E53935", linewidth=1.5, label="SINDy")
-            ax_plot.set_ylabel(lbl, fontsize=9)
-            ax_plot.legend(fontsize=8)
-            ax_plot.grid(True, alpha=0.3)
-            ax_plot.set_facecolor("#F9F9F9")
-
-        axs[-1].set_xlabel("time (s)")
-        fig_acc.suptitle("Acceleration Predictions: Ground Truth vs GNN vs SINDy",
-                         fontsize=11, fontweight="bold")
-        plt.tight_layout()
-        st.pyplot(fig_acc, use_container_width=True)
-        plt.close(fig_acc)
-
-    # ── Tab 3: Safety ──────────────────────────────────────────────────────
     with tab3:
-        st.subheader("🛡️ Safety Envelope Analysis")
-
+        st.markdown('<div class="section-header">Safety Envelope Analysis</div>', unsafe_allow_html=True)
+        st.markdown("""<div class="math-box">Every time step is checked against three physical constraints. A segment turns <b style="color:#f85149">red</b> if any threshold is exceeded.<br><br>
+<div class="math-formula">Speed:        v = sqrt(vx^2 + vy^2)            motor saturation limit</div>
+<div class="math-formula">Acceleration: a = sqrt(ax^2 + ay^2)            structural and propeller limit</div>
+<div class="math-formula">Curvature:    k = |vx*ay - vy*ax| / v^3       aerodynamic turning limit</div>
+Curvature k from differential geometry: 1/k is the instantaneous turning radius in pixels.
+</div>""", unsafe_allow_html=True)
         col_s1, col_s2 = st.columns(2)
-
+        def safety_card(label, summ):
+            pct = summ["pct_unsafe"]
+            cls = "safety-danger" if pct > 20 else ("safety-warn" if pct > 5 else "safety-safe")
+            bar_w = min(100, pct)
+            return f"""<div class="card"><div class="card-title">{label}</div>
+<div class="{cls}">{pct:.1f}% unsafe</div>
+<div class="safety-bar-bg"><div class="safety-bar-fill" style="width:{bar_w}%"></div></div>
+<div class="card-sub">Max speed: <b>{summ['max_speed']:.2f}</b> &nbsp;|&nbsp; Max accel: <b>{summ['max_accel']:.2f}</b> &nbsp;|&nbsp; Max k: <b>{summ['max_curvature']:.4f}</b></div></div>"""
         with col_s1:
-            st.markdown("#### Drawn Path")
-            pct = summary["pct_unsafe"]
-            color_str = "red" if pct > 20 else ("orange" if pct > 5 else "green")
-            st.markdown(
-                f'<p style="font-size:28px;font-weight:bold;color:{color_str}">'
-                f'{pct:.1f}% unsafe</p>',
-                unsafe_allow_html=True,
-            )
-            st.metric("Max speed",       f"{summary['max_speed']:.2f}")
-            st.metric("Max acceleration", f"{summary['max_accel']:.2f}")
-            st.metric("Max curvature",    f"{summary['max_curvature']:.4f}")
+            st.markdown(safety_card("Drawn Path", summary), unsafe_allow_html=True)
             if summary["violation_indices"]:
-                viol_pct = [
-                    f"{100*i/len(data['t']):.0f}%" 
-                    for i in summary["violation_indices"][::max(1, len(summary["violation_indices"])//5)]
-                ]
-                st.markdown(f"**Violations at:** {', '.join(viol_pct)} of path")
-
+                viol = summary["violation_indices"]
+                positions = [f"{100*i/len(data['t']):.0f}%" for i in viol[::max(1,len(viol)//6)]]
+                st.markdown(f"<small style='color:#8b949e'>Violations at: {', '.join(positions)} along path</small>", unsafe_allow_html=True)
         with col_s2:
             if sim_summary:
-                st.markdown("#### Simulated Path")
-                pct_sim = sim_summary["pct_unsafe"]
-                color_sim = "red" if pct_sim > 20 else ("orange" if pct_sim > 5 else "green")
-                st.markdown(
-                    f'<p style="font-size:28px;font-weight:bold;color:{color_sim}">'
-                    f'{pct_sim:.1f}% unsafe</p>',
-                    unsafe_allow_html=True,
-                )
-                st.metric("Max speed",        f"{sim_summary['max_speed']:.2f}")
-                st.metric("Max acceleration",  f"{sim_summary['max_accel']:.2f}")
-                st.metric("Max curvature",     f"{sim_summary['max_curvature']:.4f}")
+                st.markdown(safety_card("Simulated Path", sim_summary), unsafe_allow_html=True)
+                delta = sim_summary["pct_unsafe"] - summary["pct_unsafe"]
+                icon = "More unsafe" if delta > 2 else ("Safer" if delta < -2 else "Similar")
+                st.markdown(f"<small style='color:#8b949e'>vs drawn: {icon} ({delta:+.1f}%)</small>", unsafe_allow_html=True)
             else:
-                st.info("Run simulation to compare safety metrics.")
-
-        st.markdown("---")
-
-        # Metric plots
-        fig_m = plot_metrics(data, metrics, "Drawn Path Safety Metrics")
-        st.pyplot(fig_m, use_container_width=True)
-        plt.close(fig_m)
-
+                st.markdown('<div class="card"><div class="card-sub">Run simulation to compare</div></div>', unsafe_allow_html=True)
+        fig_s = plot_safety_metrics(data, metrics, "Drawn Path — Safety Metrics over Time")
+        st.pyplot(fig_s, use_container_width=True); plt.close(fig_s)
         if sim_data and sim_metrics:
-            fig_ms = plot_metrics(sim_data, sim_metrics, "Simulated Path Safety Metrics")
-            st.pyplot(fig_ms, use_container_width=True)
-            plt.close(fig_ms)
+            fig_ss = plot_safety_metrics(sim_data, sim_metrics, "Simulated Path — Safety Metrics over Time")
+            st.pyplot(fig_ss, use_container_width=True); plt.close(fig_ss)
 
-    # ── Tab 4: Training curve ──────────────────────────────────────────────
     with tab4:
-        st.subheader("GNN Training Progress")
+        st.markdown('<div class="section-header">GNN Training Curve</div>', unsafe_allow_html=True)
         if st.session_state.gnn_loss:
             fig_l = plot_loss(st.session_state.gnn_loss)
-            st.pyplot(fig_l, use_container_width=True)
-            plt.close(fig_l)
-            final_loss = st.session_state.gnn_loss[-1]
-            n_ep = len(st.session_state.gnn_loss)
-            st.metric("Final MSE loss", f"{final_loss:.6f}")
-            st.metric("Epochs run", n_ep)
+            st.pyplot(fig_l, use_container_width=True); plt.close(fig_l)
+            c1,c2,c3 = st.columns(3)
+            c1.metric("Final MSE loss", f"{st.session_state.gnn_loss[-1]:.6f}")
+            c2.metric("Epochs run",     len(st.session_state.gnn_loss))
+            c3.metric("Best loss",      f"{min(st.session_state.gnn_loss):.6f}")
+        density = min(100, 100*(2*k_nbrs+1)/N_points)
+        st.markdown(f"""<div class="math-box">
+<b style="color:#58a6ff">Temporal Graph G = (V, E)</b><br><br>
+Nodes |V| = {N_points} time steps, each with features [x, y, vx, vy]<br>
+Edges: node i connects to j if |i-j| <= {k_nbrs} (plus self-loop)<br>
+Each node sees {2*k_nbrs+1} neighbours — graph density = {density:.1f}%<br><br>
+<b>Row-normalised adjacency:</b>
+<div class="math-formula">A_tilde_ij = A_ij / sum_j(A_ij)</div>
+<b>Message passing:</b>
+<div class="math-formula">messages = MLP_msg(X)      (transform node features)</div>
+<div class="math-formula">M = A_tilde * messages     (aggregate from neighbours)</div>
+<div class="math-formula">h = MLP_update([X || M])   (update with own + context)</div>
+<div class="math-formula">(ax, ay) = W * h           (predict acceleration)</div>
+</div>""", unsafe_allow_html=True)
+        st.markdown("""<div class="math-box"><table style="width:100%;border-collapse:collapse;font-size:0.85rem">
+<tr style="border-bottom:1px solid #30363d">
+  <th style="text-align:left;padding:6px;color:#58a6ff">Aspect</th>
+  <th style="text-align:left;padding:6px;color:#58a6ff">Choice</th>
+  <th style="text-align:left;padding:6px;color:#58a6ff">Why</th>
+</tr>
+<tr style="border-bottom:1px solid #21262d"><td style="padding:6px;color:#c9d1d9">Supervision</td><td style="padding:6px;color:#a5d6ff">Teacher forcing</td><td style="padding:6px;color:#8b949e">Feed ground-truth states; supervise predicted accelerations</td></tr>
+<tr style="border-bottom:1px solid #21262d"><td style="padding:6px;color:#c9d1d9">Loss</td><td style="padding:6px;color:#a5d6ff">MSE on (ax, ay)</td><td style="padding:6px;color:#8b949e">Direct regression on physical quantities</td></tr>
+<tr style="border-bottom:1px solid #21262d"><td style="padding:6px;color:#c9d1d9">Optimiser</td><td style="padding:6px;color:#a5d6ff">Adam</td><td style="padding:6px;color:#8b949e">Adaptive learning rate, fast convergence</td></tr>
+<tr style="border-bottom:1px solid #21262d"><td style="padding:6px;color:#c9d1d9">Scheduler</td><td style="padding:6px;color:#a5d6ff">ReduceLROnPlateau</td><td style="padding:6px;color:#8b949e">Halves LR when loss plateaus</td></tr>
+<tr style="border-bottom:1px solid #21262d"><td style="padding:6px;color:#c9d1d9">Early stopping</td><td style="padding:6px;color:#a5d6ff">Patience = 30</td><td style="padding:6px;color:#8b949e">Prevents overtraining on single trajectory</td></tr>
+<tr><td style="padding:6px;color:#c9d1d9">Gradient clip</td><td style="padding:6px;color:#a5d6ff">Max norm = 1.0</td><td style="padding:6px;color:#8b949e">Prevents exploding gradients on sharp turns</td></tr>
+</table></div>""", unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.subheader("Graph Structure")
-        st.markdown(
-            f"""
-            **Temporal graph:**
-            - **Nodes:** {N_points} time steps, each with features `[x, y, vx, vy]`
-            - **Edges:** each node connects to its ±{k_nbrs} nearest neighbours in time + self-loop
-            - **Message passing:** source features → MLP → messages, then sum-aggregate → update MLP → acceleration prediction
-            - **Graph density:** ~{min(100, 100*(2*k_nbrs+1)/N_points):.1f}% (each node sees {2*k_nbrs+1} neighbours)
-            """
-        )
+    with tab5:
+        st.markdown('<div class="section-header">Full Pipeline — Mathematics and ML Explained</div>', unsafe_allow_html=True)
+        st.markdown("""
+<div class="math-box"><div class="step-row"><span class="step-num">1</span><div>
+<b style="color:#58a6ff">Arc-Length Resampling</b><br>
+Raw mouse strokes are unevenly spaced. Compute cumulative arc-length and interpolate to N uniform samples:
+<div class="math-formula">s_k = sum( sqrt(dx_i^2 + dy_i^2) )  then interpolate x(s), y(s) at uniform s values</div>
+This ensures dt is physically meaningful and derivatives are well-conditioned.
+</div></div></div>
+
+<div class="math-box"><div class="step-row"><span class="step-num">2</span><div>
+<b style="color:#58a6ff">Savitzky-Golay Differentiation</b><br>
+Fit a degree-p polynomial in a sliding window of width w, then differentiate analytically:
+<div class="math-formula">x_hat(t) = sum( c_k * t^k )  then  vx = dx_hat/dt  and  ax = d2x_hat/dt2</div>
+Local error O(dt^(p+1)) vs O(dt) for finite differences. Far more accurate on noisy data.
+</div></div></div>
+
+<div class="math-box"><div class="step-row"><span class="step-num">3</span><div>
+<b style="color:#58a6ff">Temporal Graph Construction</b><br>
+Each time step becomes a node with features [x, y, vx, vy]. Edges connect time neighbours:
+<div class="math-formula">A_ij = 1 if |i-j| <= k else 0  then  A_tilde = row_normalise(A)</div>
+The graph gives each node local temporal context — critical for predicting acceleration at turns.
+</div></div></div>
+
+<div class="math-box"><div class="step-row"><span class="step-num">4</span><div>
+<b style="color:#58a6ff">Graph Neural Network — Message Passing</b><br>
+<div class="math-formula">messages = MLP_msg(X)              # transform node features (Linear-Tanh-Linear)</div>
+<div class="math-formula">M = A_tilde * messages              # aggregate from temporal neighbours</div>
+<div class="math-formula">h = MLP_update( [X || M] )          # combine own features + neighbourhood context</div>
+<div class="math-formula">(ax, ay) = W * h                    # output head predicts acceleration</div>
+Trained with teacher forcing on MSE loss. Early stopping restores the best checkpoint.
+</div></div></div>
+
+<div class="math-box"><div class="step-row"><span class="step-num">5</span><div>
+<b style="color:#58a6ff">SINDy — Sequential Thresholded Least Squares (STLSQ)</b><br>
+<div class="math-formula">Step 1: w = (Theta^T * Theta)^-1 * Theta^T * a      # ordinary least squares</div>
+<div class="math-formula">Step 2: set w_i = 0 for all |w_i| &lt; lambda          # sparsity threshold</div>
+<div class="math-formula">Step 3: refit on active (non-zero) features only</div>
+<div class="math-formula">Step 4: repeat until convergence</div>
+Result: a short human-readable equation with only the truly important terms.
+</div></div></div>
+
+<div class="math-box"><div class="step-row"><span class="step-num">6</span><div>
+<b style="color:#58a6ff">RK4 Forward Simulation</b><br>
+ODE system: dx/dt=vx, dy/dt=vy, dvx/dt=f(...), dvy/dt=g(...). Integrated with 4th-order Runge-Kutta:
+<div class="math-formula">s_{n+1} = s_n + (dt/6)(k1 + 2*k2 + 2*k3 + k4)</div>
+<div class="math-formula">k1=F(s_n),  k2=F(s_n + dt/2*k1),  k3=F(s_n + dt/2*k2),  k4=F(s_n + dt*k3)</div>
+Local truncation error O(dt^5) — much more accurate than Euler integration.
+</div></div></div>
+
+<div class="math-box"><div class="step-row"><span class="step-num">7</span><div>
+<b style="color:#58a6ff">Safety Envelope — Differential Geometry</b><br>
+<div class="math-formula">Speed:        v = sqrt(vx^2 + vy^2)</div>
+<div class="math-formula">Acceleration: a = sqrt(ax^2 + ay^2)</div>
+<div class="math-formula">Curvature:    k = |vx*ay - vy*ax| / (vx^2 + vy^2)^(3/2)</div>
+k is signed curvature from differential geometry. 1/k = instantaneous turning radius. High k = tight turn = instability risk.
+</div></div></div>
+
+<div class="math-box">
+<b style="color:#58a6ff">References</b><br><br>
+Brunton, Proctor & Kutz — Discovering governing equations from data (PNAS 2016)<br>
+Kipf & Welling — Semi-supervised classification with GCNs (ICLR 2017)<br>
+Velickovic et al. — Graph attention networks (ICLR 2018)<br>
+Savitzky & Golay — Smoothing and differentiation by least squares (Anal. Chem. 1964)<br>
+de Silva et al. — PySINDy: sparse system identification package (JOSS 2020)
+</div>
+""", unsafe_allow_html=True)
 
 elif st.session_state.raw_xs is not None:
-    st.info("✅ Path captured. Click **Fit Model** to learn the dynamics.")
+    st.markdown("""<div class="card" style="border-color:#388bfd44;background:#1c2d3d">
+<div style="font-size:1.05rem;color:#58a6ff;font-weight:600">Path captured — ready to fit</div>
+<div class="card-sub">Click <b>Fit Model</b> to train the GNN and discover equations of motion</div>
+</div>""", unsafe_allow_html=True)
 else:
-    st.info("👆 Draw a path on the canvas above, then click **Fit Model**.")
+    st.markdown("""<div class="card">
+<div style="font-size:1.05rem;color:#8b949e;font-weight:600">Draw a path to get started</div>
+<div class="card-sub">Click and drag on the canvas above to sketch a drone trajectory</div>
+</div>""", unsafe_allow_html=True)
 
-# ── Footer ─────────────────────────────────────────────────────────────────
-st.markdown("---")
-st.markdown(
-    "<small style='color:gray'>Drone Path Demo · GNN + SINDy · "
-    "Draw → Fit → Simulate · No GPU required</small>",
-    unsafe_allow_html=True,
-)
+st.markdown("""<div style="margin-top:40px;padding:20px;border-top:1px solid #21262d;
+display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+<div style="color:#8b949e;font-size:0.8rem">Drone Path · Equation Finder &nbsp;·&nbsp; GNN + SINDy + RK4 &nbsp;·&nbsp; No GPU required</div>
+<div style="color:#8b949e;font-size:0.8rem">Draw → Fit → Simulate → Analyse</div>
+</div>""", unsafe_allow_html=True)
